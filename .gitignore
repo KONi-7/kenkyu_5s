@@ -1,0 +1,8 @@
+# 大容量ファイルを除外
+ck/SIDA-7B/*.bin
+ck/SIDA-13B/*.bin
+ck/*.pth
+*.log
+__pycache__/
+*.pyc
+.DS_Store
