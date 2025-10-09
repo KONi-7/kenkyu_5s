@@ -16,5 +16,10 @@ myenv/
 # 出力ディレクトリ
 vis_output/
 
+# モデルファイル（ck/ディレクトリ）
+ck/*.pth
+ck/SIDA-7B/*.bin
+ck/SIDA-13B/*.bin
+
 # データセット（必要に応じて）
 # dataset/
