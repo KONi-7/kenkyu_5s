@@ -103,7 +103,8 @@ def parse_args(args):
     return parser.parse_args(args)
 def main(args):
     args = parse_args(args)
-    deepspeed.init_distributed()
+    if not args.test_only:
+        deepspeed.init_distributed()
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -247,17 +248,18 @@ def main(args):
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
-    train_dataset = CustomDataset(
-        base_image_dir=args.dataset_dir,  
-        tokenizer=tokenizer,
-        vision_tower=args.vision_tower,  
-        split="train", 
-        precision=args.precision,  
-        image_size=args.image_size, 
+    if not args.test_only:
+        train_dataset = CustomDataset(
+            base_image_dir=args.dataset_dir,  
+            tokenizer=tokenizer,
+            vision_tower=args.vision_tower,  
+            split="train", 
+            precision=args.precision,  
+            image_size=args.image_size, 
 
-    )
-    print(f"\nInitializing datasets:")
-    print(f"Training split size: {len(train_dataset)}")
+        )
+        print(f"\nInitializing datasets:")
+        print(f"Training split size: {len(train_dataset)}")
 
     if args.no_test == False:
         test_dataset = CustomDataset(
@@ -268,12 +270,16 @@ def main(args):
             precision=args.precision, 
             image_size=args.image_size, 
     )
-        print(
-            f"Training with {len(train_dataset)} examples and testing with {len(test_dataset)} examples."
-        )
+        if not args.test_only:
+            print(
+                f"Training with {len(train_dataset)} examples and testing with {len(test_dataset)} examples."
+            )
+        else:
+            print(f"Testing with {len(test_dataset)} examples.")
     else:
         test_dataset = None
-        print(f"Training with {len(train_dataset)} examples.")
+        if not args.test_only:
+            print(f"Training with {len(train_dataset)} examples.")
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
@@ -317,33 +323,36 @@ def main(args):
             "allgather_bucket_size": 5e8,
         },
     }
-    batch_sampler = BatchSampler(
-        dataset=train_dataset,
-        batch_size=ds_config["train_micro_batch_size_per_gpu"],
-        world_size=torch.cuda.device_count(),
-        rank=args.local_rank
-    )
+    if not args.test_only:
+        batch_sampler = BatchSampler(
+            dataset=train_dataset,
+            batch_size=ds_config["train_micro_batch_size_per_gpu"],
+            world_size=torch.cuda.device_count(),
+            rank=args.local_rank
+        )
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_sampler=batch_sampler,
-        num_workers=args.workers,
-        pin_memory=True,
-        collate_fn=partial(
-            collate_fn,
-            tokenizer=tokenizer,
-            conv_type=args.conv_type,
-            use_mm_start_end=args.use_mm_start_end,
-            local_rank=args.local_rank,
-            cls_token_idx=args.cls_token_idx,
-        ),
-    )
-    model_engine, optimizer, _, scheduler = deepspeed.initialize(
-        model=model,
-        model_parameters=model.parameters(),
-        config=ds_config,
-        training_data=None, 
-    )
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_sampler=batch_sampler,
+            num_workers=args.workers,
+            pin_memory=True,
+            collate_fn=partial(
+                collate_fn,
+                tokenizer=tokenizer,
+                conv_type=args.conv_type,
+                use_mm_start_end=args.use_mm_start_end,
+                local_rank=args.local_rank,
+                cls_token_idx=args.cls_token_idx,
+            ),
+        )
+        model_engine, optimizer, _, scheduler = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            config=ds_config,
+            training_data=None, 
+        )
+    else:
+        model_engine = model.cuda()
 
     if args.auto_resume and len(args.resume) == 0:
         resume = os.path.join(args.log_dir,  "ckpt_model")
@@ -384,7 +393,8 @@ def main(args):
              ),
         )
 
-    train_iter = iter(train_loader)
+    if not args.test_only:
+        train_iter = iter(train_loader)
 
     best_acc, best_score, cur_ciou = 0.0, 0.0, 0.0
 
@@ -632,9 +642,10 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
             union_meter.update(union)
             acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
 
-    intersection_meter.all_reduce()
-    union_meter.all_reduce()
-    acc_iou_meter.all_reduce()
+    if not args.test_only:
+        intersection_meter.all_reduce()
+        union_meter.all_reduce()
+        acc_iou_meter.all_reduce()
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     ciou = iou_class[1] if len(iou_class) > 1 else 0.0
