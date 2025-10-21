@@ -59,6 +59,28 @@ Compared with state-of-the-art deepfake detection models on SID-Set and other be
 pip install -r requirements.txt
 ```
 
+## Quick Start (Run evaluation without large model weights)
+
+1. Create a virtual environment and install requirements:
+
+```
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+2. Place the small test dataset in `./test/` (or unzip `test.zip` into `./test/`).
+
+3. If you have the SAM weights, place `sam_vit_h_4b8939.pth` in `./ck/`.
+
+4. Run the quick evaluation (uses 1% sample by default):
+
+```
+CUDA_VISIBLE_DEVICES=0 python test.py --version="./ck/SIDA-7B" --dataset_dir='./test' --vision_pretrained="./ck/sam_vit_h_4b8939.pth" --precision fp16 --test_batch_size 1 --sample_ratio 0.01 --test_only
+```
+
+Note: you can run with `--sample_ratio 1.0` to evaluate on the entire test set.
+
 ## Dataset Access
 
 We provide two methods to access the **SID_Set dataset**:

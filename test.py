@@ -63,6 +63,8 @@ def parse_args(args):
         type=int,
     )
     parser.add_argument("--test_batch_size", default=1, type=int)
+    parser.add_argument("--sample_ratio", default=None, type=float,
+                        help="Fraction of test batches to sample for quick evaluation (0-1)")
     parser.add_argument("--workers", default=4, type=int)
     parser.add_argument("--lr", default=0.00001, type=float)
 
@@ -399,7 +401,7 @@ def main(args):
     best_acc, best_score, cur_ciou = 0.0, 0.0, 0.0
 
     if args.test_only:
-        acc, giou, ciou, _ = test(test_loader, model_engine, 0, writer, args) 
+        acc, giou, ciou, _ = test(test_loader, model_engine, 0, writer, args, sample_ratio=args.sample_ratio) 
         exit()
 
     test_epochs = [1,3,5,7,10]
@@ -423,7 +425,7 @@ def main(args):
                 print(f"\nPerforming test after epoch {epoch + 1}")
 
             if args.no_test == False:
-                acc, giou, ciou, _ = test(test_loader, model_engine, epoch, writer, args)
+                acc, giou, ciou, _ = test(test_loader, model_engine, epoch, writer, args, sample_ratio=args.sample_ratio)
                 best_score = max(giou, best_score)
                 is_best_iou = giou > best_score
                 cur_ciou = ciou if is_best_iou else cur_ciou
@@ -568,6 +570,7 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
     confusion_matrix = torch.zeros(num_classes, num_classes, device='cuda')
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
+    target_meter = AverageMeter("Target", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
 
     # Calculate total number of batches and samples to use
@@ -577,6 +580,10 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
         # Generate random indices for sampling
         sample_indices = set(random.sample(range(total_batches), num_batches))
         print(f"\ntest on {num_batches}/{total_batches} randomly sampled batches...")
+
+    # Lists for AUC and PR computation (pixel-wise) for tampered masks
+    all_mask_scores = []
+    all_mask_labels = []
 
     for batch_idx, input_dict in enumerate(tqdm.tqdm(test_loader)):
         # Skip batches not in our sample if sampling is enabled
@@ -628,18 +635,53 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
             assert len(pred_masks) == 1
 
             intersection, union, acc_iou = 0.0, 0.0, 0.0
-            for mask_i, output_i in zip(masks_list, output_list):
-                intersection_i, union_i, _ = intersectionAndUnionGPU(
+            area_target_total = None
+            for mask_idx, (mask_i, output_i) in enumerate(zip(masks_list, output_list)):
+                # compute intersection/union
+                intersection_i, union_i, area_target_i = intersectionAndUnionGPU(
                     output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
                 )
                 intersection += intersection_i
                 union += union_i
                 acc_iou += intersection_i / (union_i + 1e-5)
                 acc_iou[union_i == 0] += 1.0  # no-object target
+
+                # collect pixel-wise probabilities and labels for AUC/PR computation
+                # pred_masks[0] shape: [num_masks, H, W]
+                try:
+                    pred_score_map = pred_masks[0][mask_idx]
+                except Exception:
+                    # fallback: use the binary output if indexing fails
+                    pred_score_map = output_i.float()
+                # Convert logits to probabilities via sigmoid for ranking metrics
+                pred_prob_map = torch.sigmoid(pred_score_map).detach().cpu().numpy().reshape(-1)
+                gt_map = mask_i.detach().cpu().numpy().reshape(-1)
+                all_mask_scores.append(pred_prob_map)
+                all_mask_labels.append(gt_map)
+                # accumulate area_target per class
+                try:
+                    area_np = area_target_i.detach().cpu().numpy()
+                except Exception:
+                    try:
+                        area_np = np.array(area_target_i)
+                    except Exception:
+                        area_np = None
+                if area_np is not None:
+                    if area_target_total is None:
+                        area_target_total = area_np
+                    else:
+                        area_target_total = area_target_total + area_np
             intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
+            # area_target_i was computed inside the loop; but we only need per-mask values aggregated
             acc_iou = acc_iou.cpu().numpy() / masks_list.shape[0]
             intersection_meter.update(intersection)
             union_meter.update(union)
+            # area_target has been accumulated and is a tensor/array
+            if area_target_total is not None:
+                target_meter.update(area_target_total)
+            else:
+                # no gt masks present in this sample
+                target_meter.update(np.array([0.0, 0.0]))
             acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
 
     if not args.test_only:
@@ -677,16 +719,98 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
 
 
     pixel_correct = intersection_meter.sum[1]  
-    pixel_total = union_meter.sum[1]  
-    pixel_accuracy = pixel_correct / (pixel_total + 1e-10) * 100.0
+    # total positive pixels in GT
+    pixel_gt_total = target_meter.sum[1] if len(target_meter.sum) > 1 else target_meter.sum
+    # total predicted positive (can be derived)
+    pixel_pred_total = union_meter.sum[1] + intersection_meter.sum[1] - target_meter.sum[1]
+    # compute pixel accuracy (TP + TN) / total
+    # total pixels = sum of target counts for all classes
+    total_pixels = target_meter.sum.sum() if isinstance(target_meter.sum, np.ndarray) else target_meter.sum
+    if total_pixels == 0:
+        pixel_accuracy = 0.0
+    else:
+        tp = intersection_meter.sum[1]
+        fp = union_meter.sum[1] - target_meter.sum[1]
+        fn = target_meter.sum[1] - intersection_meter.sum[1]
+        tn = total_pixels - (tp + fp + fn)
+        pixel_accuracy = (tp + tn) / (total_pixels + 1e-10) * 100.0
 
     iou = ciou  
-    f1_score = 2 * (iou * accuracy / 100) / (iou + accuracy / 100 + 1e-10) if (iou + accuracy / 100) > 0 else 0.0
+    # compute segmentation F1 from aggregated pixel counts
+    if target_meter.sum[1] + union_meter.sum[1] + intersection_meter.sum[1] == 0:
+        seg_f1 = 0.0
+    else:
+        tp = intersection_meter.sum[1]
+        fp = union_meter.sum[1] - target_meter.sum[1]
+        fn = target_meter.sum[1] - intersection_meter.sum[1]
+        seg_f1 = 2.0 * tp / (2.0 * tp + fp + fn + 1e-10)
 
     avg_precision = np.mean([metrics['precision'] for metrics in per_class_metrics.values()])
     avg_recall = np.mean([metrics['recall'] for metrics in per_class_metrics.values()])
 
-    auc_approx = avg_precision * avg_recall
+    # Compute AUC / Average Precision for mask localization using collected scores
+    auc_roc = None
+    auc_pr = None
+    max_pr_f1 = None
+    try:
+        import sklearn.metrics as skl_metrics
+        if len(all_mask_labels) > 0:
+            y_scores = np.concatenate(all_mask_scores)
+            y_true = np.concatenate(all_mask_labels)
+            # remove ignore labels if any (255)
+            valid_mask = (y_true != 255)
+            if valid_mask.sum() > 0 and y_true.sum() > 0 and (y_true.size - y_true.sum()) > 0:
+                auc_roc = float(skl_metrics.roc_auc_score(y_true[valid_mask], y_scores[valid_mask]))
+                auc_pr = float(skl_metrics.average_precision_score(y_true[valid_mask], y_scores[valid_mask]))
+                precision_pr, recall_pr, _ = skl_metrics.precision_recall_curve(y_true[valid_mask], y_scores[valid_mask])
+                f1s = (2 * precision_pr * recall_pr) / (precision_pr + recall_pr + 1e-10)
+                max_pr_f1 = float(np.nanmax(f1s))
+            else:
+                auc_roc = None
+                auc_pr = None
+                max_pr_f1 = None
+    except Exception:
+        # fallback: coarse thresholding if sklearn not available
+        if len(all_mask_labels) > 0:
+            y_scores = np.concatenate(all_mask_scores)
+            y_true = np.concatenate(all_mask_labels)
+            valid_mask = (y_true != 255)
+            if valid_mask.sum() > 0 and y_true.sum() > 0 and (y_true.size - y_true.sum()) > 0:
+                thresholds = np.linspace(0.0, 1.0, 101)
+                tprs = []
+                fprs = []
+                precs = []
+                recs = []
+                for t in thresholds:
+                    preds = (y_scores >= t).astype(np.int32)
+                    tp = np.logical_and(preds == 1, y_true == 1).sum()
+                    fp = np.logical_and(preds == 1, y_true == 0).sum()
+                    fn = np.logical_and(preds == 0, y_true == 1).sum()
+                    tn = np.logical_and(preds == 0, y_true == 0).sum()
+                    if (tp + fn) > 0:
+                        tpr = tp / (tp + fn)
+                    else:
+                        tpr = 0.0
+                    if (fp + tn) > 0:
+                        fpr = fp / (fp + tn)
+                    else:
+                        fpr = 0.0
+                    if (tp + fp) > 0:
+                        prec = tp / (tp + fp)
+                    else:
+                        prec = 0.0
+                    if (tp + fn) > 0:
+                        rec = tp / (tp + fn)
+                    else:
+                        rec = 0.0
+                    tprs.append(tpr)
+                    fprs.append(fpr)
+                    precs.append(prec)
+                    recs.append(rec)
+                auc_roc = float(np.trapz(tprs, fprs))
+                auc_pr = float(np.trapz(precs[::-1], recs[::-1]))
+                f1s = [(2 * p * r) / (p + r + 1e-10) for p, r in zip(precs, recs)]
+                max_pr_f1 = float(np.max(f1s))
 
     if args.local_rank == 0:
         writer.add_scalar("test/accuracy", accuracy, epoch)
@@ -694,20 +818,30 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
         writer.add_scalar("test/ciou", ciou, epoch)
         writer.add_scalar("test/pixel_accuracy", pixel_accuracy, epoch)
         writer.add_scalar("test/iou", iou, epoch)
-        writer.add_scalar("test/f1_score", f1_score, epoch)
-        writer.add_scalar("test/auc_approx", auc_approx, epoch)
+        writer.add_scalar("test/seg_f1", seg_f1, epoch)
+        if auc_roc is not None:
+            writer.add_scalar("test/auc_roc", auc_roc, epoch)
+        if auc_pr is not None:
+            writer.add_scalar("test/auc_pr", auc_pr, epoch)
+        if max_pr_f1 is not None:
+            writer.add_scalar("test/max_pr_f1", max_pr_f1, epoch)
         for class_name, metrics in per_class_metrics.items():
-         for metric_name, value in metrics.items():
-             writer.add_scalar(f"test/{class_name.lower().replace('/', '_')}_{metric_name}", value, epoch)
+            for metric_name, value in metrics.items():
+                writer.add_scalar(f"test/{class_name.lower().replace('/', '_')}_{metric_name}", value, epoch)
 
         test_type = "Full" if sample_ratio is None else f"Sampled ({sample_ratio*100}%)"
         print(f"\n{test_type} test Results:")
         print(f"giou: {giou:.4f}, ciou: {ciou:.4f}")
         print(f"Classification Accuracy: {accuracy:.4f}%")
         print(f"Pixel Accuracy: {pixel_accuracy:.4f}%")
-        print(f"IoU: {iou:.4f}")
-        print(f"F1 Score: {f1_score:.4f}")
-        print(f"Approximate AUC: {auc_approx:.4f}")
+        print(f"IoU (Tampered): {iou:.4f}")
+        print(f"Segmentation F1 (pixel-level): {seg_f1:.4f}")
+        if auc_roc is not None:
+            print(f"AUC (ROC) for localization: {auc_roc:.4f}")
+        if auc_pr is not None:
+            print(f"AUC (PR / AP) for localization: {auc_pr:.4f}")
+        if max_pr_f1 is not None:
+            print(f"Max F1 on PR curve: {max_pr_f1:.4f}")
         print(f"Total correct classifications: {correct}")
         print(f"Total classification samples: {total}")
         print("\nPer-Class Metrics:")
@@ -717,6 +851,11 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
             print(f"  Precision: {metrics['precision']:.4f}")
             print(f"  Recall:    {metrics['recall']:.4f}")
             print(f"  F1 Score:  {metrics['f1']:.4f}")
+
+        # report detection metric specifically for tampered class
+        tampered_metrics = per_class_metrics.get('Tampered', None)
+        if tampered_metrics is not None:
+            print(f"\nDetection (Tampered) - Precision: {tampered_metrics['precision']:.4f}, F1: {tampered_metrics['f1']:.4f}")
 
         print("\nConfusion Matrix:")
         print("Predicted ")
