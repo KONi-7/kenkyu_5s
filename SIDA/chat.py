@@ -1,12 +1,15 @@
 import argparse
 import os
 import sys
+import time     #追加
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor
+from thop import profile #追加
+import torch.profiler  # 追加
 
 from model.SIDA import SIDAForCausalLM
 from model.llava import conversation as conversation_lib
@@ -43,6 +46,9 @@ def parse_args(args):
         type=str,
         choices=["llava_v1", "llava_llama_2"],
     )
+
+    parser.add_argument("--measure_flops", action="store_true", default=False)#追加
+
     return parser.parse_args(args)
 
 
@@ -199,15 +205,76 @@ def main(args):
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
 
-        output_ids, pred_masks = model.evaluate(
-            image_clip,
-            image,
-            input_ids,
-            resize_list,
-            original_size_list,
-            max_new_tokens=512,
-            tokenizer=tokenizer,
-        )
+        
+        #追加
+        # 計算コスト測定開始
+        torch.cuda.reset_peak_memory_stats()
+        start_time = time.time()
+
+        
+                # 推論（プロファイルなし／ありを切り替え）
+        if args.measure_flops:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            with torch.profiler.profile(
+                activities=activities,
+                with_flops=True,
+                profile_memory=False,
+                record_shapes=False,
+            ) as prof:
+                output_ids, pred_masks = model.evaluate(
+                    image_clip,
+                    image,
+                    input_ids,
+                    resize_list,
+                    original_size_list,
+                    max_new_tokens=512,
+                    tokenizer=tokenizer,
+                )
+            total_flops = sum(ev.flops for ev in prof.key_averages() if ev.flops)
+            print(f"Total FLOPs: {total_flops / 1e12:.2f} TFLOPs")
+        else:
+            output_ids, pred_masks = model.evaluate(
+                image_clip,
+                image,
+                input_ids,
+                resize_list,
+                original_size_list,
+                max_new_tokens=512,
+                tokenizer=tokenizer,
+            )
+        #追加)
+
+                # 計算コスト測定終了
+        end_time = time.time()
+        inference_time = end_time - start_time
+        peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+
+        # FLOPs計算をここに移動（推論後）
+        try:
+            llama = model.model  # LlamaModel
+            llama.eval()
+            dummy_input_ids = torch.randint(
+                0, tokenizer.vocab_size, (1, 10), device=llama.device
+            )
+
+            flops, params = profile(
+                llama,
+                inputs=(dummy_input_ids,),
+                verbose=False,
+            )
+            print(f"Language FLOPs: {flops / 1e12:.2f} TFLOPs")
+        except Exception as e:
+            print(f"FLOPs calculation failed: {e}")
+
+        # コスト表示
+        print(f"Inference Time: {inference_time:.4f} seconds")
+        print(f"Peak GPU Memory: {peak_memory:.2f} GB")
+        #追加)
+
+
         output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
 
         text_output = tokenizer.decode(output_ids, skip_special_tokens=False)

@@ -1,0 +1,38 @@
+# Ignore model checkpoints and large binaries
+*.bin
+*.pth
+*.pt
+*.ckpt
+*.tar
+*.zip
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Virtualenv
+.venv/
+venv/
+myenv/
+
+# Logs and outputs
+*.log
+*.out
+*.tmp
+
+# Dataset and large generated files
+dataset/
+test.zip
+masks/
+tampered/
+full_synthetic/
+real/
+vis_output/
+
+# Local checkpoints and runs
+runs/
+ck/
+
+# Editor
+.vscode/
+*.swp
