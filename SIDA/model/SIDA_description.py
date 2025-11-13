@@ -15,7 +15,7 @@ from .segment_anything import build_sam_vit_h
 from torchviz import make_dot
 import itertools 
 
-import deepspeed
+# import deepspeed
 
 def dice_loss(
     inputs: torch.Tensor,
