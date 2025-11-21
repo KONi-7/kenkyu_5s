@@ -1,12 +1,16 @@
 import argparse
 import os
 import sys
+import time     #追加
+import torch.nn as nn  # 追加
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor
+from thop import profile #追加
+import torch.profiler  # 追加
 
 from model.SIDA import SIDAForCausalLM
 from model.llava import conversation as conversation_lib
@@ -14,6 +18,98 @@ from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
+
+
+#追加
+KEEP_TOKEN_RATIO = 0.7 # 残す割合（必要に応じて調整）
+
+def aggregate_token_scores(attentions: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """Return attention scores from the newest token back to the prompt tokens."""
+    # attentions: tuple[layer] -> (batch, num_heads, seq_len, seq_len)
+    last_layer = attentions[-1].mean(dim=1)  # (batch, seq_len, seq_len)
+    # Focus on the attention distribution of the newly generated token (last row) toward previous tokens.
+    return last_layer[:, -1, :-1].contiguous()  # drop self token
+
+def select_salient_tokens(input_ids: torch.Tensor,
+                          attention_mask: torch.Tensor,
+                          attentions: tuple[torch.Tensor, ...],
+                          keep_ratio: float,
+                          tokenizer) -> torch.Tensor:
+    scores = aggregate_token_scores(attentions)[0]  # (seq_len - 1,)
+    scores = scores / (scores.sum() + 1e-6)
+
+    full_seq_len = input_ids.size(1)
+    device = input_ids.device
+
+    if scores.size(0) != full_seq_len - 1:
+        target = full_seq_len - 1
+        if scores.size(0) < target:
+            pad = target - scores.size(0)
+            scores = F.pad(scores, (0, pad), value=0.0)
+        else:
+            scores = scores[:target]
+
+    keep_quota = max(int(scores.size(0) * keep_ratio), 0)
+
+    raw_special_tokens = [tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id]
+    flat_special_ids: list[int] = []
+    for tok in raw_special_tokens:
+        if tok is None:
+            continue
+        if isinstance(tok, (list, tuple)):
+            flat_special_ids.extend(tok)
+        else:
+            flat_special_ids.append(tok)
+    special_ids = (torch.tensor(flat_special_ids, device=device, dtype=input_ids.dtype)
+                   if flat_special_ids else torch.empty(0, device=device, dtype=input_ids.dtype))
+
+    prompt_tokens = input_ids[0, :full_seq_len - 1]
+    mandatory_mask = torch.zeros_like(scores, dtype=torch.bool)
+
+    # BOS を保持
+    mandatory_mask[0] = True
+
+    # 特殊トークン
+    if special_ids.numel() > 0:
+        is_special = torch.isin(prompt_tokens, special_ids)
+    else:
+        is_special = torch.zeros_like(mandatory_mask, dtype=torch.bool)
+
+    # 画像トークン
+    is_image_token = (prompt_tokens == IMAGE_TOKEN_INDEX)
+
+    # テキストトークン = 画像でも特殊でもない
+    is_text_token = (~is_image_token) & (~is_special)
+
+    # テキスト系（特殊＋通常）は全部 mandatory
+    mandatory_mask |= is_special
+    mandatory_mask |= is_text_token
+    # 画像トークンは mandatory に入れない
+
+    keep_indices = torch.nonzero(mandatory_mask, as_tuple=False).squeeze(1)
+
+    remaining_quota = max(keep_quota - keep_indices.numel(), 0)
+    available_slots = scores.size(0) - keep_indices.numel()
+    if remaining_quota > 0 and available_slots > 0:
+        candidate_scores = scores.clone()
+        candidate_scores[mandatory_mask] = float('-inf')
+        k = min(remaining_quota, available_slots)
+        if k > 0:
+            top_indices = torch.topk(candidate_scores, k=k).indices
+            keep_indices = torch.cat([keep_indices, top_indices])
+
+    keep_indices = torch.cat([torch.tensor([0], device=device), keep_indices])  # ensure BOS
+    keep_indices = keep_indices.unique()
+    keep_indices, _ = torch.sort(keep_indices)
+
+    keep_indices_full = torch.cat([keep_indices, torch.tensor([full_seq_len - 1], device=device)])
+    keep_indices_full = keep_indices_full.unique()
+    keep_indices_full, _ = torch.sort(keep_indices_full)
+
+    return keep_indices_full
+#追加)
+
+
 
 
 def parse_args(args):
@@ -43,6 +139,9 @@ def parse_args(args):
         type=str,
         choices=["llava_v1", "llava_llama_2"],
     )
+
+    parser.add_argument("--measure_flops", action="store_true", default=False)#追加
+
     return parser.parse_args(args)
 
 
@@ -123,6 +222,7 @@ def main(args):
     if torch.cuda.is_available():
         model = model.cuda()
 
+    print("Before vision tower initialization")
     try:
         model.get_model().initialize_vision_modules(model.get_model().config)
         vision_tower = model.get_model().get_vision_tower()
@@ -130,6 +230,7 @@ def main(args):
     except AttributeError:
         print("Vision tower initialization skipped as SIDA-7B-v1 may not have this module.")
 
+    print("Before precision setting")
     if args.precision == "bf16":
         model = model.bfloat16().cuda()
     elif args.precision == "fp16":
@@ -137,10 +238,21 @@ def main(args):
     else:
         model = model.float().cuda()
 
+    print("Before clip_image_processor")
     clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(args.image_size)
 
+    print("Before model.eval()")
     model.eval()
+    print("Model loaded successfully")
+
+    #追加
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+        print(f"Using {torch.cuda.device_count()} GPUs")
+    else:
+        model = model.cuda()
+    #追加)
 
     while True:
         conv = conversation_lib.conv_templates[args.conv_type].copy()
@@ -199,15 +311,105 @@ def main(args):
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
 
-        output_ids, pred_masks = model.evaluate(
-            image_clip,
-            image,
-            input_ids,
-            resize_list,
-            original_size_list,
-            max_new_tokens=512,
-            tokenizer=tokenizer,
-        )
+        #追加
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long).cuda()
+        sida_model = model.module if isinstance(model, nn.DataParallel) else model
+
+        with torch.inference_mode():
+            warm_outputs = sida_model.generate(
+                images=image_clip,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=1,
+                do_sample=False,
+                output_attentions=True,
+                return_dict_in_generate=True,
+            )
+
+        attentions = warm_outputs.attentions
+        if attentions is None or len(attentions) == 0:
+            keep_indices = torch.arange(input_ids.size(1), device=input_ids.device)
+        else:
+            attn_layers = attentions[-1] if isinstance(attentions[0], tuple) else attentions
+            attn_layers = tuple(attn_layers)
+            keep_indices = select_salient_tokens(
+                input_ids,
+                attention_mask,
+                attn_layers,
+                KEEP_TOKEN_RATIO,
+                tokenizer,
+            )
+
+        input_ids = input_ids[:, keep_indices]
+        attention_mask = attention_mask[:, keep_indices]
+
+        # 計算コスト測定開始
+        torch.cuda.reset_peak_memory_stats()
+        start_time = time.time()
+
+        
+                # 推論（プロファイルなし／ありを切り替え）
+        if args.measure_flops:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            with torch.profiler.profile(
+                activities=activities,
+                with_flops=True,
+                profile_memory=False,
+                record_shapes=False,
+            ) as prof:
+                output_ids, pred_masks = model.evaluate(
+                    image_clip,
+                    image,
+                    input_ids,
+                    resize_list,
+                    original_size_list,
+                    max_new_tokens=512,
+                    tokenizer=tokenizer,
+                )
+            total_flops = sum(ev.flops for ev in prof.key_averages() if ev.flops)
+            print(f"Total FLOPs: {total_flops / 1e12:.2f} TFLOPs")
+        else:
+            output_ids, pred_masks = model.evaluate(
+                image_clip,
+                image,
+                input_ids,
+                resize_list,
+                original_size_list,
+                max_new_tokens=512,
+                tokenizer=tokenizer,
+            )
+
+                # 計算コスト測定終了
+        end_time = time.time()
+        inference_time = end_time - start_time
+        peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+
+        # FLOPs計算をここに移動（推論後）
+        try:
+            llama = model.model  # LlamaModel
+            llama.eval()
+            dummy_input_ids = torch.randint(
+                0, tokenizer.vocab_size, (1, 10), device=llama.device
+            )
+
+            flops, params = profile(
+                llama,
+                inputs=(dummy_input_ids,),
+                verbose=False,
+            )
+            print(f"Language FLOPs: {flops / 1e12:.2f} TFLOPs")
+        except Exception as e:
+            print(f"FLOPs calculation failed: {e}")
+
+        # コスト表示
+        print(f"Inference Time: {inference_time:.4f} seconds")
+        print(f"Peak GPU Memory: {peak_memory:.2f} GB")
+        #追加)
+
+
         output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
 
         text_output = tokenizer.decode(output_ids, skip_special_tokens=False)

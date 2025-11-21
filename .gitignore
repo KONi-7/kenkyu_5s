@@ -13,6 +13,7 @@ __pycache__/
 # Virtualenv
 .venv/
 venv/
+myenv/
 
 # Logs and outputs
 *.log

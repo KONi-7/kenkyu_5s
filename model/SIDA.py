@@ -15,7 +15,7 @@ from .segment_anything import build_sam_vit_h
 from torchviz import make_dot
 import itertools
 
-import deepspeed
+# import deepspeed
 
 def dice_loss(
     inputs: torch.Tensor,
@@ -423,22 +423,29 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
                 output_hidden_states=True,
                 return_dict_in_generate=True,
             )
-            output_hidden_states = outputs.hidden_states[-1]  # Shape: [batch_size, sequence_length, hidden_size]
-            output_ids = outputs.sequences  # Generated sequences
+            # hidden_states は [num_layers, batch, seq_len, hidden] ではなく
+            # generate の仕様により "ステップ" ごとのリストになることがあるので、
+            # ここでは最後のレイヤの最後のシーケンスを取り出す前提で扱う
+            output_hidden_states = outputs.hidden_states[-1]  # [B, L_h, H]
+            output_ids = outputs.sequences                     # [B, L_seq]
 
             # Assume batch_size=1 for simplicity (as seen in chat.py)
             batch_size = output_ids.shape[0]
             assert batch_size == 1, "Batch size > 1 not handled in this example"
 
+            # hidden と token IDs の長さを揃える
+            B, L_h, _ = output_hidden_states.shape
+            _, L_seq = output_ids.shape
+            if L_seq > L_h:
+                # sequences の方が長い場合は、先頭側を hidden の長さに合わせて切る
+                output_ids = output_ids[:, :L_h]
+            elif L_seq < L_h:
+                # 念のため hidden 側を短くするケースもハンドル
+                output_hidden_states = output_hidden_states[:, :L_seq, :]
+
             # Find positions of [CLS] tokens in the sequence
-            cls_token_mask = (output_ids[:, 1:] == self.cls_token_idx)
-            cls_token_mask = torch.cat(
-                [
-                    torch.zeros((cls_token_mask.shape[0], 255)).bool().cuda(),
-                    cls_token_mask
-                ],
-                dim=1
-            )
+            # output_ids: [B, L], output_hidden_states: [B, L, H]
+            cls_token_mask = (output_ids == self.cls_token_idx)  # [B, L]
 
             pred_masks = []
             predicted_class = None
@@ -451,14 +458,8 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
                     predicted_class = torch.argmax(last_cls_result, dim=-1).item()
                     if predicted_class == 2:
                         # Proceed with segmentation if class is tampered
-                        seg_token_mask = (output_ids[:, 1:] == self.seg_token_idx)
-                        seg_token_mask = torch.cat(
-                            [
-                                torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(),
-                                seg_token_mask
-                            ],
-                            dim=1
-                        )
+                        # seg_token_mask も output_ids と同じ長さにする
+                        seg_token_mask = (output_ids == self.seg_token_idx)  # [B, L]
                         # Process hidden states for segmentation
                         hidden_states = []
                         hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))

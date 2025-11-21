@@ -5,12 +5,12 @@ import sys
 import time
 from functools import partial
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import deepspeed
+# import deepspeed
 import numpy as np
 import torch
 import tqdm
 import transformers
-from peft import LoraConfig, get_peft_model
+# from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 from model.SIDA import SIDAForCausalLM
 from model.llava import conversation as conversation_lib
@@ -19,11 +19,219 @@ from utils.batch_sampler import BatchSampler
 import torch.distributed as dist
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
-                         intersectionAndUnionGPU)
+                         intersectionAndUnionGPU, IGNORE_INDEX,
+                         IMAGE_TOKEN_INDEX)
 import random
 import torch.nn.functional as F
 import warnings
 warnings.filterwarnings("ignore")
+
+KEEP_TOKEN_RATIO = 0.3
+
+
+def aggregate_token_scores(attentions: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """Average heads and collect attention from the newest token to previous ones."""
+    last_layer = attentions[-1].mean(dim=1)  # (batch, seq_len, seq_len)
+    return last_layer[:, -1, :-1].contiguous()  # drop self position
+
+
+def select_salient_tokens_batch(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    attentions: tuple[torch.Tensor, ...],
+    keep_ratio: float,
+    tokenizer,
+) -> list[torch.Tensor]:
+    device = input_ids.device
+    batch_size, _ = input_ids.shape
+    scores = aggregate_token_scores(attentions)
+
+    raw_special_tokens = [tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id]
+    flat_special_ids: list[int] = []
+    for tok in raw_special_tokens:
+        if tok is None:
+            continue
+        if isinstance(tok, (list, tuple)):
+            flat_special_ids.extend(tok)
+        else:
+            flat_special_ids.append(tok)
+    special_ids = (
+        torch.tensor(flat_special_ids, device=device, dtype=input_ids.dtype)
+        if flat_special_ids
+        else torch.empty(0, device=device, dtype=input_ids.dtype)
+    )
+
+    keep_indices_batch: list[torch.Tensor] = []
+    for b in range(batch_size):
+        valid_len = int(attention_mask[b].sum().item())
+        if valid_len <= 1:
+            keep_indices_batch.append(torch.arange(valid_len, device=device, dtype=torch.long))
+            continue
+
+        sample_scores = scores[b]
+        target = max(valid_len - 1, 1)
+        if sample_scores.size(0) != target:
+            if sample_scores.size(0) < target:
+                pad = target - sample_scores.size(0)
+                sample_scores = F.pad(sample_scores, (0, pad), value=0.0)
+            else:
+                sample_scores = sample_scores[:target]
+
+        sample_scores = sample_scores / (sample_scores.sum() + 1e-6)
+
+        prompt_tokens = input_ids[b, :valid_len - 1]
+        mandatory_mask = torch.zeros_like(sample_scores, dtype=torch.bool)
+        mandatory_mask[0] = True  # keep BOS
+
+        # 特殊トークン: BOS/EOS/PAD など
+        if special_ids.numel() > 0:
+            is_special = torch.isin(prompt_tokens, special_ids)
+        else:
+            is_special = torch.zeros_like(prompt_tokens, dtype=torch.bool)
+
+        # 画像トークン
+        is_image_token = prompt_tokens == IMAGE_TOKEN_INDEX
+
+        # テキストトークン = 特殊でも画像でもないもの
+        is_text_token = (~is_special) & (~is_image_token)
+
+        # 特殊トークンとテキストトークンはすべて保持（画像トークンのみスコアで間引く）
+        mandatory_mask |= is_special | is_text_token
+
+        keep_indices = torch.nonzero(mandatory_mask, as_tuple=False).squeeze(1)
+
+        keep_quota = max(int(sample_scores.size(0) * keep_ratio), 0)
+        remaining_quota = max(keep_quota - keep_indices.numel(), 0)
+        available_slots = sample_scores.size(0) - keep_indices.numel()
+
+        if remaining_quota > 0 and available_slots > 0:
+            candidate_scores = sample_scores.clone()
+            candidate_scores[mandatory_mask] = float("-inf")
+            k = min(remaining_quota, available_slots)
+            if k > 0:
+                top_indices = torch.topk(candidate_scores, k=k).indices
+                keep_indices = torch.cat([keep_indices, top_indices])
+
+        keep_indices = torch.cat([torch.tensor([0], device=device, dtype=torch.long), keep_indices])
+        keep_indices = keep_indices.unique()
+        keep_indices, _ = torch.sort(keep_indices)
+
+        keep_indices_full = torch.cat(
+            [keep_indices, torch.tensor([valid_len - 1], device=device, dtype=torch.long)]
+        )
+        keep_indices_full = keep_indices_full.unique()
+        keep_indices_full, _ = torch.sort(keep_indices_full)
+
+        keep_indices_batch.append(keep_indices_full.long())
+
+    return keep_indices_batch
+
+
+def prune_batch_inputs(
+    model,
+    input_dict: dict,
+    tokenizer,
+    keep_ratio: float,
+):
+    if keep_ratio <= 0 or keep_ratio >= 1:
+        return input_dict
+
+    input_ids = input_dict.get("input_ids")
+    attention_masks = input_dict.get("attention_masks")
+    images_clip = input_dict.get("images_clip")
+
+    if input_ids is None or attention_masks is None or images_clip is None:
+        return input_dict
+
+    if input_ids.dim() != 2 or input_ids.size(1) <= 2:
+        return input_dict
+
+    sidamodel = model.module if hasattr(model, "module") else model
+
+    attn_mask_long = attention_masks.long()
+
+    with torch.inference_mode():
+        warm_outputs = sidamodel(
+            images=images_clip,
+            input_ids=input_ids,
+            attention_mask=attn_mask_long,
+            past_key_values=None,
+            use_cache=False,
+            output_attentions=True,
+            return_dict=True,
+        )
+
+    attentions = warm_outputs.attentions
+    if attentions is None or len(attentions) == 0:
+        return input_dict
+
+    attn_layers = attentions[-1] if isinstance(attentions[0], tuple) else attentions
+    attn_layers = tuple(attn_layers)
+
+    keep_indices_batch = select_salient_tokens_batch(
+        input_ids,
+        attn_mask_long,
+        attn_layers,
+        keep_ratio,
+        tokenizer,
+    )
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id or 0
+
+    batch_size = input_ids.size(0)
+    device = input_ids.device
+
+    pruned_ids = []
+    pruned_masks = []
+    pruned_labels = []
+
+    labels = input_dict.get("labels")
+
+    new_max_len = 0
+    for b in range(batch_size):
+        keep_idx = keep_indices_batch[b]
+        if keep_idx.numel() == 0:
+            keep_idx = torch.tensor([0], device=device, dtype=torch.long)
+
+        sample_ids = input_ids[b, keep_idx]
+        pruned_ids.append(sample_ids)
+
+        mask_val = torch.ones_like(sample_ids, dtype=attention_masks.dtype)
+        pruned_masks.append(mask_val)
+
+        if labels is not None:
+            pruned_labels.append(labels[b, keep_idx])
+
+        new_max_len = max(new_max_len, sample_ids.size(0))
+
+    padded_input_ids = input_ids.new_full((batch_size, new_max_len), pad_token_id)
+    padded_attention_masks = attention_masks.new_zeros((batch_size, new_max_len))
+
+    padded_labels = None
+    if pruned_labels:
+        padded_labels = labels.new_full((batch_size, new_max_len), IGNORE_INDEX)
+
+    for b in range(batch_size):
+        seq_len = pruned_ids[b].size(0)
+        padded_input_ids[b, :seq_len] = pruned_ids[b]
+
+        if padded_attention_masks.dtype == torch.bool:
+            padded_attention_masks[b, :seq_len] = True
+        else:
+            padded_attention_masks[b, :seq_len] = pruned_masks[b]
+
+        if padded_labels is not None:
+            padded_labels[b, :seq_len] = pruned_labels[b]
+
+    input_dict["input_ids"] = padded_input_ids
+    input_dict["attention_masks"] = padded_attention_masks
+    if padded_labels is not None:
+        input_dict["labels"] = padded_labels
+
+    return input_dict
+
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="SIDA Model Training")
@@ -106,7 +314,8 @@ def parse_args(args):
 def main(args):
     args = parse_args(args)
     if not args.test_only:
-        deepspeed.init_distributed()
+        # deepspeed.init_distributed()
+        pass
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -210,21 +419,21 @@ def main(args):
                 ):
                     lora_module_names.add(name)
             return sorted(list(lora_module_names))
-        lora_alpha = args.lora_alpha
-        lora_dropout = args.lora_dropout
-        lora_target_modules = find_linear_layers(
-                model, args.lora_target_modules.split(",")
-        )
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+        # lora_alpha = args.lora_alpha
+        # lora_dropout = args.lora_dropout
+        # lora_target_modules = find_linear_layers(
+        #         model, args.lora_target_modules.split(",")
+        # )
+        # lora_config = LoraConfig(
+        #     r=lora_r,
+        #     lora_alpha=lora_alpha,
+        #     target_modules=lora_target_modules,
+        #     lora_dropout=lora_dropout,
+        #     bias="none",
+        #     task_type="CAUSAL_LM",
+        # )
+        # model = get_peft_model(model, lora_config)
+        # model.print_trainable_parameters()
     model.resize_token_embeddings(len(tokenizer))
 
     for n, p in model.named_parameters():
@@ -347,32 +556,33 @@ def main(args):
                 cls_token_idx=args.cls_token_idx,
             ),
         )
-        model_engine, optimizer, _, scheduler = deepspeed.initialize(
-            model=model,
-            model_parameters=model.parameters(),
-            config=ds_config,
-            training_data=None, 
-        )
+        # model_engine, optimizer, _, scheduler = deepspeed.initialize(
+        #     model=model,
+        #     model_parameters=model.parameters(),
+        #     config=ds_config,
+        #     training_data=None, 
+        # )
+        model_engine = model.cuda()
     else:
         model_engine = model.cuda()
 
-    if args.auto_resume and len(args.resume) == 0:
-        resume = os.path.join(args.log_dir,  "ckpt_model")
-        if os.path.exists(resume):
-            args.resume = resume
+    # if args.auto_resume and len(args.resume) == 0:
+    #     resume = os.path.join(args.log_dir,  "ckpt_model")
+    #     if os.path.exists(resume):
+    #         args.resume = resume
 
-    if args.resume:
-        load_path, client_state = model_engine.load_checkpoint(args.resume)
-        with open(os.path.join(args.resume, "latest"), "r") as f:
-            ckpt_dir = f.readlines()[0].strip()
-        args.start_epoch = (
-            int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        )
-        print(
-            "resume training from {}, start from epoch {}".format(
-                args.resume, args.start_epoch
-            )
-        )
+    # if args.resume:
+    #     load_path, client_state = model_engine.load_checkpoint(args.resume)
+    #     with open(os.path.join(args.resume, "latest"), "r") as f:
+    #         ckpt_dir = f.readlines()[0].strip()
+    #     args.start_epoch = (
+    #         int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
+    #     )
+    #     print(
+    #         "resume training from {}, start from epoch {}".format(
+    #         args.resume, args.start_epoch
+    #     )
+    # )
 
     if test_dataset is not None:
         test_sampler = BatchSampler(
@@ -401,7 +611,7 @@ def main(args):
     best_acc, best_score, cur_ciou = 0.0, 0.0, 0.0
 
     if args.test_only:
-        acc, giou, ciou, _ = test(test_loader, model_engine, 0, writer, args, sample_ratio=args.sample_ratio) 
+        acc, giou, ciou, _ = test(test_loader, model_engine, 0, writer, args, tokenizer, sample_ratio=args.sample_ratio) 
         exit()
 
     test_epochs = [1,3,5,7,10]
@@ -425,7 +635,7 @@ def main(args):
                 print(f"\nPerforming test after epoch {epoch + 1}")
 
             if args.no_test == False:
-                acc, giou, ciou, _ = test(test_loader, model_engine, epoch, writer, args, sample_ratio=args.sample_ratio)
+                acc, giou, ciou, _ = test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio=args.sample_ratio)
                 best_score = max(giou, best_score)
                 is_best_iou = giou > best_score
                 cur_ciou = ciou if is_best_iou else cur_ciou
@@ -560,9 +770,8 @@ def train(
                 writer.add_scalar("train/lr", curr_lr[0], global_step)
 
     return train_iter
-import random
 
-def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
+def test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio=None):
     model_engine.eval()
     correct = 0
     total = 0
@@ -614,6 +823,13 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
         else:
             input_dict["images"] = input_dict["images"].float()
             input_dict["images_clip"] = input_dict["images_clip"].float()
+
+        try:
+            input_dict = prune_batch_inputs(model_engine, input_dict, tokenizer, KEEP_TOKEN_RATIO)
+        except RuntimeError as exc:
+            if batch_idx == 0:
+                print(f"Token pruning skipped due to error: {exc}")
+
         input_dict['inference'] = True
         with torch.no_grad():
             output_dict = model_engine(**input_dict)
