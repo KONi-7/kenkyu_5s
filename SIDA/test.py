@@ -16,14 +16,21 @@ from model.SIDA import SIDAForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.SID_Set import collate_fn, CustomDataset
 from utils.batch_sampler import BatchSampler
+from utils.pruning import prune_batch_inputs
 import torch.distributed as dist
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
-                         intersectionAndUnionGPU)
+                         intersectionAndUnionGPU, IGNORE_INDEX,
+                         IMAGE_TOKEN_INDEX)
 import random
 import torch.nn.functional as F
 import warnings
 warnings.filterwarnings("ignore")
+
+from model.llava.model.token_pruning import prune_sequence_tensor
+
+KEEP_TOKEN_RATIO = 0.3
+
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="SIDA Model Training")
@@ -88,6 +95,12 @@ def parse_args(args):
     parser.add_argument("--test_only", action="store_true", default=False)
     parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
+    parser.add_argument(
+        "--prune_observe_layer",
+        default=-24,
+        type=int,
+        help="Layer index (can be negative) up to which we run observe-phase before pruning",
+    )
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--print_freq", default=1, type=int)
     parser.add_argument("--start_epoch", default=0, type=int)
@@ -103,6 +116,8 @@ def parse_args(args):
     )
 
     return parser.parse_args(args)
+
+
 def main(args):
     args = parse_args(args)
     if not args.test_only:
@@ -403,7 +418,7 @@ def main(args):
     best_acc, best_score, cur_ciou = 0.0, 0.0, 0.0
 
     if args.test_only:
-        acc, giou, ciou, _ = test(test_loader, model_engine, 0, writer, args, sample_ratio=args.sample_ratio) 
+        acc, giou, ciou, _ = test(test_loader, model_engine, 0, writer, args, tokenizer, sample_ratio=args.sample_ratio) 
         exit()
 
     test_epochs = [1,3,5,7,10]
@@ -427,7 +442,7 @@ def main(args):
                 print(f"\nPerforming test after epoch {epoch + 1}")
 
             if args.no_test == False:
-                acc, giou, ciou, _ = test(test_loader, model_engine, epoch, writer, args, sample_ratio=args.sample_ratio)
+                acc, giou, ciou, _ = test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio=args.sample_ratio)
                 best_score = max(giou, best_score)
                 is_best_iou = giou > best_score
                 cur_ciou = ciou if is_best_iou else cur_ciou
@@ -562,13 +577,23 @@ def train(
                 writer.add_scalar("train/lr", curr_lr[0], global_step)
 
     return train_iter
-import random
 
-def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
+def test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio=None):
     model_engine.eval()
     correct = 0
     total = 0
     num_classes = 3
+    special_token_ids = [
+        tok
+        for tok in [
+            tokenizer.bos_token_id,
+            tokenizer.eos_token_id,
+            tokenizer.pad_token_id,
+            args.cls_token_idx,
+            args.seg_token_idx,
+        ]
+        if tok is not None
+    ]
     confusion_matrix = torch.zeros(num_classes, num_classes, device='cuda')
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
@@ -616,6 +641,20 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
         else:
             input_dict["images"] = input_dict["images"].float()
             input_dict["images_clip"] = input_dict["images_clip"].float()
+
+        try:
+            input_dict = prune_batch_inputs(
+                model_engine,
+                input_dict,
+                tokenizer,
+                KEEP_TOKEN_RATIO,
+                args.prune_observe_layer,
+                special_token_ids,
+            )
+        except RuntimeError as exc:
+            if batch_idx == 0:
+                print(f"Token pruning skipped due to error: {exc}")
+
         input_dict['inference'] = True
         with torch.no_grad():
             output_dict = model_engine(**input_dict)
