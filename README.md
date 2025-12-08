@@ -81,6 +81,24 @@ CUDA_VISIBLE_DEVICES=0 python test.py --version="./ck/SIDA-7B" --dataset_dir='./
 
 Note: you can run with `--sample_ratio 1.0` to evaluate on the entire test set.
 
+## Interactive Chat Inference
+
+You can launch the interactive `chat.py` frontend with the same observe-layer pruning that `test.py` uses:
+
+```
+CUDA_VISIBLE_DEVICES=0 python chat.py \
+  --version="./ck/SIDA-7B" \
+  --vision_pretrained="./ck/sam_vit_h_4b8939.pth" \
+  --precision fp16 \
+  --keep_token_ratio 0.3 \
+  --prune_observe_layer -24 \
+  --max_new_tokens 512
+```
+
+- `--keep_token_ratio` controls how many image tokens remain after the observe phase (match `test.py`).
+- `--prune_observe_layer` selects how many early decoder layers are run before pruning (negative values count from the end).
+- `--max_new_tokens` limits the chat response length while reusing cached hidden states from the observe phase.
+
 ## Dataset Access
 
 We provide two methods to access the **SID_Set dataset**:

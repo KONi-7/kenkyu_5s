@@ -1,19 +1,26 @@
 from typing import List, Optional, Tuple
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import InstructBlipQFormerConfig, InstructBlipQFormerModel, AutoTokenizer
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_PATCH_TOKEN)
+                         DEFAULT_IMAGE_PATCH_TOKEN, IMAGE_TOKEN_INDEX)
 
 from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
                                                      LlavaLlamaModel)
+from .llava.model.token_pruning import (compute_image_token_keep_indices,
+                                        prune_attention_mask,
+                                        prune_sequence_tensor)
 
 from .segment_anything import build_sam_vit_h
 
 from torchviz import make_dot
 import itertools
+
+
+logger = logging.getLogger(__name__)
 
 # import deepspeed
 
@@ -165,6 +172,166 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
         self.model.initialize_sida_modules(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
+
+    def _build_position_ids(self, attention_mask: torch.Tensor) -> torch.Tensor:
+        mask = attention_mask.long()
+        position_ids = mask.cumsum(dim=-1) - 1
+        position_ids.masked_fill_(mask == 0, 0)
+        return position_ids
+
+    @torch.inference_mode()
+    def observe_prune_prompt(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        images: Optional[torch.Tensor] = None,
+        keep_ratio: float = 0.5,
+        observe_layer: int = -1,
+        special_token_ids: Optional[List[int]] = None,
+    ) -> dict:
+        if attention_mask.dim() != 2:
+            raise ValueError("attention_mask must be 2-D for observe_prune_prompt")
+
+        batch_size, seq_len = input_ids.shape
+        if batch_size != attention_mask.shape[0]:
+            raise ValueError("input_ids and attention_mask batch sizes must match")
+
+        num_layers = self.config.num_hidden_layers
+        layer_index = observe_layer if observe_layer >= 0 else num_layers + observe_layer
+        if layer_index < 0 or layer_index >= num_layers:
+            raise ValueError(
+                f"observe_layer must be within [-{num_layers}, {num_layers - 1}]"
+            )
+
+        keep_ratio = max(min(keep_ratio, 1.0), 0.0)
+        mask_dtype = attention_mask.dtype
+
+        observe_outputs = super(SIDAForCausalLM, self).forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            images=images,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+            observe_layers=[layer_index],
+            collect_attentions=True,
+            stop_at_last_observe_layer=True,
+        )
+
+        if not observe_outputs.observed_attentions:
+            raise RuntimeError("observe_prune_prompt requires observed attentions")
+        if not observe_outputs.observed_hidden_states:
+            raise RuntimeError("observe_prune_prompt requires observed hidden states")
+
+        attn_tensor = observe_outputs.observed_attentions[-1]
+        boundary_hidden = observe_outputs.observed_hidden_states[-1]
+
+        if attn_tensor.dim() == 3:
+            attn_tensor = attn_tensor.unsqueeze(0)
+        elif attn_tensor.dim() == 4 and attn_tensor.shape[0] != batch_size:
+            if attn_tensor.shape[1] == batch_size:
+                attn_tensor = attn_tensor.permute(1, 0, 2, 3).contiguous()
+            else:
+                attn_tensor = attn_tensor.reshape(batch_size, *attn_tensor.shape[1:])
+
+        if boundary_hidden.dim() == 2:
+            boundary_hidden = boundary_hidden.unsqueeze(0)
+        elif boundary_hidden.dim() == 3 and boundary_hidden.shape[0] != batch_size:
+            if boundary_hidden.shape[1] == batch_size:
+                boundary_hidden = boundary_hidden.transpose(0, 1).contiguous()
+            else:
+                boundary_hidden = boundary_hidden.reshape(batch_size, -1, boundary_hidden.shape[-1])
+
+        keep_indices = compute_image_token_keep_indices(
+            attn_tensor,
+            input_ids,
+            attention_mask,
+            keep_ratio=keep_ratio,
+            image_token_id=IMAGE_TOKEN_INDEX,
+            special_token_ids=special_token_ids,
+        )
+
+        def build_identity_keep_indices():
+            attention_mask_bool = attention_mask.to(dtype=torch.bool, device=input_ids.device)
+            identity = []
+            for b in range(batch_size):
+                valid_positions = torch.nonzero(attention_mask_bool[b], as_tuple=False).squeeze(1)
+                if valid_positions.numel() == 0:
+                    valid_positions = torch.arange(seq_len, device=input_ids.device)
+                identity.append(valid_positions)
+            return identity
+
+        if len(keep_indices) != batch_size:
+            logger.warning(
+                "observe_prune_prompt received %d keep index sets for batch size %d; falling back to no pruning.",
+                len(keep_indices),
+                batch_size,
+            )
+            keep_indices = build_identity_keep_indices()
+        else:
+            identity_cache = None
+            for b in range(batch_size):
+                if keep_indices[b].numel() == 0:
+                    logger.warning(
+                        "observe_prune_prompt computed empty keep set for sample %d; keeping all valid tokens instead.",
+                        b,
+                    )
+                    if identity_cache is None:
+                        identity_cache = build_identity_keep_indices()
+                    keep_indices[b] = identity_cache[b]
+
+        pad_token_id = self.config.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.config.eos_token_id or 0
+
+        pruned_input_ids, lengths = prune_sequence_tensor(
+            input_ids, keep_indices, pad_value=pad_token_id
+        )
+        pruned_attention_mask = prune_attention_mask(attention_mask, keep_indices)
+
+        position_ids = self._build_position_ids(attention_mask)
+        pruned_position_ids, _ = prune_sequence_tensor(
+            position_ids, keep_indices, pad_value=0
+        )
+        pruned_position_ids = pruned_position_ids.long()
+
+        pruned_hidden, _ = prune_sequence_tensor(
+            boundary_hidden, keep_indices, pad_value=0.0
+        )
+
+        resume_outputs = None
+        if layer_index < num_layers - 1 and pruned_hidden.size(1) > 0:
+            resume_mask = pruned_attention_mask
+            if resume_mask.dtype != torch.bool:
+                resume_mask_bool = resume_mask.to(dtype=torch.bool)
+            else:
+                resume_mask_bool = resume_mask
+            resume_outputs = self.model.forward_from_layer(
+                hidden_states=pruned_hidden,
+                attention_mask=resume_mask_bool,
+                position_ids=pruned_position_ids,
+                past_key_values=None,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+                observe_layers=None,
+                collect_attentions=False,
+                stop_at_last_observe_layer=False,
+                layer_start=layer_index + 1,
+            )
+
+        return {
+            "input_ids": pruned_input_ids,
+            "attention_mask": pruned_attention_mask.to(dtype=mask_dtype),
+            "position_ids": pruned_position_ids,
+            "hidden_states": pruned_hidden,
+            "keep_indices": keep_indices,
+            "lengths": lengths,
+            "observe_outputs": observe_outputs,
+            "resume_outputs": resume_outputs,
+        }
     def get_visual_embs(self, pixel_values: torch.FloatTensor):
         with torch.no_grad():
             image_embeddings_list = []
@@ -199,33 +366,71 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
         inference: bool = False,  # Flag for inference mode
         **kwargs,
     ):
+        cached_hidden_states = kwargs.pop("cached_hidden_states", None)
         if images.size(0) != images_clip.size(0):
             raise ValueError(f"Batch size mismatch: images {images.size(0)} != images_clip {images_clip.size(0)}")
         image_embeddings = self.get_visual_embs(images)
         B, C, H, W = image_embeddings.shape
-        
+        device = input_ids.device
+
+        def _align_mask_length(mask: torch.Tensor, target_len: int) -> torch.Tensor:
+            current_len = mask.shape[1]
+            if current_len == target_len:
+                return mask
+            if current_len > target_len:
+                return mask[:, current_len - target_len :]
+            pad = torch.zeros(
+                (mask.shape[0], target_len - current_len),
+                dtype=mask.dtype,
+                device=mask.device,
+            )
+            return torch.cat([pad, mask], dim=1)
+
+        def _match_mask_to_logits(mask: torch.Tensor, logits_flat: torch.Tensor) -> torch.Tensor:
+            target_len = logits_flat.shape[0]
+            mask_flat = mask.reshape(-1)
+            current_len = mask_flat.shape[0]
+            if current_len == target_len:
+                return mask_flat
+            if current_len > target_len:
+                return mask_flat[current_len - target_len :]
+            pad = torch.zeros(
+                target_len - current_len,
+                dtype=mask_flat.dtype,
+                device=mask_flat.device,
+            )
+            return torch.cat([pad, mask_flat], dim=0)
+
         assert B == len(offset) - 1
         cls_token_mask = (input_ids[:,1:] == self.cls_token_idx)
-        cls_token_mask = torch.cat([
-            cls_token_mask,
-            torch.zeros((cls_token_mask.shape[0], 1)).bool().cuda()
-            ], 
-            dim=1)
-        cls_token_mask =  torch.cat(
+        cls_token_mask = torch.cat(
             [
-            torch.zeros((cls_token_mask.shape[0], 255)).bool().cuda(),  # Padding with 255 zeros at the beginning
-            cls_token_mask,
+                cls_token_mask,
+                torch.zeros((cls_token_mask.shape[0], 1), dtype=torch.bool, device=device),
             ],
-                dim=1,
-            )
+            dim=1,
+        )
+        cls_token_mask = torch.cat(
+            [
+                torch.zeros((cls_token_mask.shape[0], 255), dtype=torch.bool, device=device),
+                cls_token_mask,
+            ],
+            dim=1,
+        )
         seg_token_mask = (input_ids[:, 1:] == self.seg_token_idx)
+        seg_token_mask = torch.cat(
+            [
+                torch.zeros((seg_token_mask.shape[0], 255), dtype=torch.bool, device=device),
+                seg_token_mask,
+                torch.zeros((seg_token_mask.shape[0], 1), dtype=torch.bool, device=device),
+            ],
+            dim=1,
+        )
 
-        seg_token_mask = torch.cat([
-            torch.zeros((seg_token_mask.shape[0], 255), dtype=torch.bool, device=input_ids.device),
-            seg_token_mask,
-            torch.zeros((seg_token_mask.shape[0], 1),   dtype=torch.bool, device=input_ids.device)], dim=1)
-
-        if inference:
+        if cached_hidden_states is not None:
+            output_hidden_states = [cached_hidden_states]
+            output = None
+        elif inference:
             n_batch = 1
             length = input_ids.shape[0]
             assert images_clip.shape[0] == 1
@@ -268,9 +473,15 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             output_hidden_states = output.hidden_states
             # Geting cls information
         assert len(self.model.cls_head) == 1
-        last_hidden_state_cls = self.model.cls_head[0](output_hidden_states[-1]) 
+        last_layer_hidden = output_hidden_states[-1]
+        cls_token_mask = _align_mask_length(cls_token_mask, last_layer_hidden.shape[1])
+        seg_token_mask = _align_mask_length(seg_token_mask, last_layer_hidden.shape[1])
 
-        cls_result = last_hidden_state_cls[cls_token_mask]
+        last_hidden_state_cls = self.model.cls_head[0](last_layer_hidden)
+
+        cls_logits_flat = last_hidden_state_cls.view(-1, last_hidden_state_cls.shape[-1])
+        cls_mask_flat = _match_mask_to_logits(cls_token_mask, cls_logits_flat)
+        cls_result = cls_logits_flat[cls_mask_flat]
 
         logits = cls_result
         loss_fct = nn.CrossEntropyLoss()
@@ -283,7 +494,10 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             hidden_states = []
             hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-            pred_embeddings = last_hidden_state[seg_token_mask]
+
+            last_hidden_state_flat = last_hidden_state.reshape(-1, last_hidden_state.shape[-1])
+            seg_mask_flat = _match_mask_to_logits(seg_token_mask, last_hidden_state_flat)
+            pred_embeddings = last_hidden_state_flat[seg_mask_flat]
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
             seg_token_offset = seg_token_counts.cumsum(-1)
             seg_token_offset = torch.cat(

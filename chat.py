@@ -17,97 +17,8 @@ from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
-
-
-#追加
-KEEP_TOKEN_RATIO = 0.7 # 残す割合（必要に応じて調整）
-
-def aggregate_token_scores(attentions: tuple[torch.Tensor, ...]) -> torch.Tensor:
-    """Return attention scores from the newest token back to the prompt tokens."""
-    # attentions: tuple[layer] -> (batch, num_heads, seq_len, seq_len)
-    last_layer = attentions[-1].mean(dim=1)  # (batch, seq_len, seq_len)
-    # Focus on the attention distribution of the newly generated token (last row) toward previous tokens.
-    return last_layer[:, -1, :-1].contiguous()  # drop self token
-
-def select_salient_tokens(input_ids: torch.Tensor,
-                          attention_mask: torch.Tensor,
-                          attentions: tuple[torch.Tensor, ...],
-                          keep_ratio: float,
-                          tokenizer) -> torch.Tensor:
-    scores = aggregate_token_scores(attentions)[0]  # (seq_len - 1,)
-    scores = scores / (scores.sum() + 1e-6)
-
-    full_seq_len = input_ids.size(1)
-    device = input_ids.device
-
-    if scores.size(0) != full_seq_len - 1:
-        target = full_seq_len - 1
-        if scores.size(0) < target:
-            pad = target - scores.size(0)
-            scores = F.pad(scores, (0, pad), value=0.0)
-        else:
-            scores = scores[:target]
-
-    keep_quota = max(int(scores.size(0) * keep_ratio), 0)
-
-    raw_special_tokens = [tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id]
-    flat_special_ids: list[int] = []
-    for tok in raw_special_tokens:
-        if tok is None:
-            continue
-        if isinstance(tok, (list, tuple)):
-            flat_special_ids.extend(tok)
-        else:
-            flat_special_ids.append(tok)
-    special_ids = (torch.tensor(flat_special_ids, device=device, dtype=input_ids.dtype)
-                   if flat_special_ids else torch.empty(0, device=device, dtype=input_ids.dtype))
-
-    prompt_tokens = input_ids[0, :full_seq_len - 1]
-    mandatory_mask = torch.zeros_like(scores, dtype=torch.bool)
-
-    # BOS を保持
-    mandatory_mask[0] = True
-
-    # 特殊トークン
-    if special_ids.numel() > 0:
-        is_special = torch.isin(prompt_tokens, special_ids)
-    else:
-        is_special = torch.zeros_like(mandatory_mask, dtype=torch.bool)
-
-    # 画像トークン
-    is_image_token = (prompt_tokens == IMAGE_TOKEN_INDEX)
-
-    # テキストトークン = 画像でも特殊でもない
-    is_text_token = (~is_image_token) & (~is_special)
-
-    # テキスト系（特殊＋通常）は全部 mandatory
-    mandatory_mask |= is_special
-    mandatory_mask |= is_text_token
-    # 画像トークンは mandatory に入れない
-
-    keep_indices = torch.nonzero(mandatory_mask, as_tuple=False).squeeze(1)
-
-    remaining_quota = max(keep_quota - keep_indices.numel(), 0)
-    available_slots = scores.size(0) - keep_indices.numel()
-    if remaining_quota > 0 and available_slots > 0:
-        candidate_scores = scores.clone()
-        candidate_scores[mandatory_mask] = float('-inf')
-        k = min(remaining_quota, available_slots)
-        if k > 0:
-            top_indices = torch.topk(candidate_scores, k=k).indices
-            keep_indices = torch.cat([keep_indices, top_indices])
-
-    keep_indices = torch.cat([torch.tensor([0], device=device), keep_indices])  # ensure BOS
-    keep_indices = keep_indices.unique()
-    keep_indices, _ = torch.sort(keep_indices)
-
-    keep_indices_full = torch.cat([keep_indices, torch.tensor([full_seq_len - 1], device=device)])
-    keep_indices_full = keep_indices_full.unique()
-    keep_indices_full, _ = torch.sort(keep_indices_full)
-
-    return keep_indices_full
-#追加)
+                         DEFAULT_IMAGE_TOKEN)
+from utils.pruning import prune_batch_inputs
 
 
 
@@ -129,6 +40,12 @@ def parse_args(args):
     parser.add_argument(
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
     )
+    parser.add_argument(
+        "--vision_pretrained",
+        default="PATH_TO_SAM_ViT-H",
+        type=str,
+        help="Path to pretrained SAM ViT-H checkpoint",
+    )
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
@@ -138,6 +55,24 @@ def parse_args(args):
         default="llava_v1",
         type=str,
         choices=["llava_v1", "llava_llama_2"],
+    )
+
+    parser.add_argument(
+        "--prune_keep_ratio",
+        type=float,
+        default=0.3,
+        help="Fraction of image tokens to keep after observe-layer pruning",
+    )
+    parser.add_argument(
+        "--prune_observe_layer",
+        type=int,
+        default=-24,
+        help="Layer index (supports negative indexing) to stop observe phase",
+    )
+    parser.add_argument(
+        "--disable_token_pruning",
+        action="store_true",
+        help="Skip token pruning and run full prompt through all layers",
     )
 
     parser.add_argument("--measure_flops", action="store_true", default=False)#追加
@@ -162,6 +97,163 @@ def preprocess(
     return x
 
 
+def _pad_token_mask(mask: torch.Tensor, pad_left: int, pad_right: int) -> torch.Tensor:
+    left = torch.zeros((mask.shape[0], pad_left), dtype=torch.bool, device=mask.device)
+    right = torch.zeros((mask.shape[0], pad_right), dtype=torch.bool, device=mask.device)
+    return torch.cat([left, mask, right], dim=1)
+
+
+def run_pruned_inference(
+    sida_model,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    image: torch.Tensor,
+    resize_list,
+    original_size_list,
+):
+    device = input_ids.device
+    batch = input_ids.shape[0]
+
+    if isinstance(hidden_states, torch.Tensor):
+        hidden_states = hidden_states.detach().clone().contiguous()
+
+    def _align_mask_length(mask: torch.Tensor, target_len: int) -> torch.Tensor:
+        current_len = mask.shape[1]
+        if current_len == target_len:
+            return mask
+        if current_len > target_len:
+            return mask[:, current_len - target_len :]
+        pad = torch.zeros(
+            (mask.shape[0], target_len - current_len),
+            dtype=mask.dtype,
+            device=mask.device,
+        )
+        return torch.cat([pad, mask], dim=1)
+
+    def _match_mask_to_logits(mask: torch.Tensor, logits_flat: torch.Tensor) -> torch.Tensor:
+        target_len = logits_flat.shape[0]
+        mask_flat = mask.reshape(-1)
+        current_len = mask_flat.shape[0]
+        if current_len == target_len:
+            return mask_flat
+        if current_len > target_len:
+            return mask_flat[current_len - target_len :]
+        pad = torch.zeros(
+            target_len - current_len,
+            dtype=mask_flat.dtype,
+            device=mask_flat.device,
+        )
+        return torch.cat([pad, mask_flat], dim=0)
+
+    cls_token_mask = (input_ids[:, 1:] == sida_model.cls_token_idx)
+    cls_token_mask = torch.cat(
+        [
+            cls_token_mask,
+            torch.zeros((batch, 1), dtype=torch.bool, device=device),
+        ],
+        dim=1,
+    )
+    cls_token_mask = _pad_token_mask(cls_token_mask, pad_left=255, pad_right=0)
+    cls_token_mask = _align_mask_length(cls_token_mask, hidden_states.shape[1])
+
+    last_hidden_state_cls = sida_model.model.cls_head[0](hidden_states)
+    cls_logits_flat = last_hidden_state_cls.view(-1, last_hidden_state_cls.shape[-1])
+    cls_mask_flat = _match_mask_to_logits(cls_token_mask, cls_logits_flat)
+    cls_result = cls_logits_flat[cls_mask_flat]
+
+    predicted_class = 0
+    if cls_result.shape[0] > 0:
+        predicted_class = torch.argmax(cls_result[-1], dim=-1).item()
+
+    pred_masks = []
+    if predicted_class == 2:
+        seg_token_mask = (input_ids[:, 1:] == sida_model.seg_token_idx)
+        seg_token_mask = _pad_token_mask(seg_token_mask, pad_left=255, pad_right=1)
+        seg_token_mask = _align_mask_length(seg_token_mask, hidden_states.shape[1])
+
+        if seg_token_mask.any():
+            hidden_proj = sida_model.model.text_hidden_fcs[0](hidden_states)
+            last_hidden_state = hidden_proj
+
+            last_hidden_state_flat = last_hidden_state.reshape(
+                -1, last_hidden_state.shape[-1]
+            )
+            seg_mask_flat = _match_mask_to_logits(seg_token_mask, last_hidden_state_flat)
+            pred_embeddings = last_hidden_state_flat[seg_mask_flat]
+
+            seg_token_counts = seg_token_mask.int().sum(-1)
+            seg_token_offset = seg_token_counts.cumsum(-1)
+            seg_token_offset = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.long, device=device),
+                    seg_token_offset,
+                ],
+                dim=0,
+            )
+            offset = torch.arange(0, batch + 1, dtype=torch.long, device=device)
+            seg_token_offset = seg_token_offset[offset]
+
+            pred_embeddings_ = []
+            for i in range(len(seg_token_offset) - 1):
+                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+                pred_embeddings_.append(pred_embeddings[start_i:end_i])
+
+            pred_embeddings = pred_embeddings_
+
+            cls_projected = sida_model.model.sida_fc1(cls_result)
+            enhanced_pred_embeddings = []
+            for i in range(len(pred_embeddings)):
+                if pred_embeddings[i].shape[0] == 0:
+                    enhanced_pred_embeddings.append(pred_embeddings[i])
+                    continue
+                query = cls_projected[i].unsqueeze(0)
+                key = pred_embeddings[i]
+                value = pred_embeddings[i]
+                attn_output, _ = sida_model.model.attention_layer(
+                    query=query, key=key, value=value
+                )
+                enhanced_embeddings = pred_embeddings[i] + attn_output
+                enhanced_pred_embeddings.append(enhanced_embeddings)
+
+            image_embeddings = sida_model.get_visual_embs(image)
+            multimask_output = False
+
+            for i in range(len(enhanced_pred_embeddings)):
+                if enhanced_pred_embeddings[i].shape[0] == 0:
+                    continue
+                sparse_embeddings, dense_embeddings = sida_model.model.visual_model.prompt_encoder(
+                    points=None,
+                    boxes=None,
+                    masks=None,
+                    text_embeds=enhanced_pred_embeddings[i].unsqueeze(1),
+                )
+                sparse_embeddings = sparse_embeddings.to(
+                    enhanced_pred_embeddings[i].dtype
+                )
+                low_res_masks, _ = sida_model.model.visual_model.mask_decoder(
+                    image_embeddings=image_embeddings[i].unsqueeze(0),
+                    image_pe=sida_model.model.visual_model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=multimask_output,
+                )
+                original_size = (
+                    original_size_list[i]
+                    if original_size_list is not None
+                    else resize_list[i]
+                )
+                pred_mask = sida_model.model.visual_model.postprocess_masks(
+                    low_res_masks,
+                    input_size=resize_list[i],
+                    original_size=original_size,
+                )
+                pred_masks.append(pred_mask[:, 0])
+
+    return {
+        "predicted_class": predicted_class,
+        "logits": cls_result,
+        "pred_masks": pred_masks,
+    }
 def main(args):
     args = parse_args(args)
     os.makedirs(args.vis_save_path, exist_ok=True)
@@ -211,7 +303,13 @@ def main(args):
         )
 
     model = SIDAForCausalLM.from_pretrained(
-        args.version, low_cpu_mem_usage=True, vision_tower=args.vision_tower, seg_token_idx=args.seg_token_idx, cls_token_idx=args.cls_token_idx, **kwargs
+        args.version,
+        low_cpu_mem_usage=True,
+        vision_tower=args.vision_tower,
+        seg_token_idx=args.seg_token_idx,
+        cls_token_idx=args.cls_token_idx,
+        vision_pretrained=args.vision_pretrained,
+        **kwargs,
     )
 
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -311,44 +409,70 @@ def main(args):
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
 
-        #追加
         attention_mask = torch.ones_like(input_ids, dtype=torch.long).cuda()
         sida_model = model.module if isinstance(model, nn.DataParallel) else model
 
-        with torch.inference_mode():
-            warm_outputs = sida_model.generate(
-                images=image_clip,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=1,
-                do_sample=False,
-                output_attentions=True,
-                return_dict_in_generate=True,
-            )
+        special_token_ids = [
+            tok
+            for tok in [
+                tokenizer.bos_token_id,
+                tokenizer.eos_token_id,
+                tokenizer.pad_token_id,
+                args.cls_token_idx,
+                args.seg_token_idx,
+            ]
+            if tok is not None
+        ]
 
-        attentions = warm_outputs.attentions
-        if attentions is None or len(attentions) == 0:
-            keep_indices = torch.arange(input_ids.size(1), device=input_ids.device)
-        else:
-            attn_layers = attentions[-1] if isinstance(attentions[0], tuple) else attentions
-            attn_layers = tuple(attn_layers)
-            keep_indices = select_salient_tokens(
-                input_ids,
-                attention_mask,
-                attn_layers,
-                KEEP_TOKEN_RATIO,
+        input_dict = {
+            "input_ids": input_ids,
+            "attention_masks": attention_mask,
+            "images_clip": image_clip,
+        }
+
+        if not args.disable_token_pruning:
+            input_dict = prune_batch_inputs(
+                model,
+                input_dict,
                 tokenizer,
+                keep_ratio=args.prune_keep_ratio,
+                observe_layer=args.prune_observe_layer,
+                special_token_ids=special_token_ids,
+            )
+        else:
+            input_dict.setdefault(
+                "keep_indices",
+                [torch.arange(input_ids.shape[1], device=input_ids.device)],
             )
 
-        input_ids = input_ids[:, keep_indices]
-        attention_mask = attention_mask[:, keep_indices]
+        input_ids = input_dict["input_ids"].to(input_ids.device)
+        attention_mask = input_dict["attention_masks"].to(attention_mask.device)
+        cached_hidden_states = input_dict.get("cached_hidden_states")
 
-        # 計算コスト測定開始
+        if cached_hidden_states is None:
+            with torch.inference_mode():
+                fallback = sida_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    images=image_clip,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            cached_hidden_states = fallback.hidden_states[-1].detach()
+
+        def execute_inference():
+            return run_pruned_inference(
+                sida_model=sida_model,
+                hidden_states=cached_hidden_states,
+                input_ids=input_ids,
+                image=image,
+                resize_list=resize_list,
+                original_size_list=original_size_list,
+            )
+
         torch.cuda.reset_peak_memory_stats()
         start_time = time.time()
 
-        
-                # 推論（プロファイルなし／ありを切り替え）
         if args.measure_flops:
             activities = [torch.profiler.ProfilerActivity.CPU]
             if torch.cuda.is_available():
@@ -359,32 +483,18 @@ def main(args):
                 profile_memory=False,
                 record_shapes=False,
             ) as prof:
-                output_ids, pred_masks = model.evaluate(
-                    image_clip,
-                    image,
-                    input_ids,
-                    resize_list,
-                    original_size_list,
-                    max_new_tokens=512,
-                    tokenizer=tokenizer,
-                )
+                inference_outputs = execute_inference()
             total_flops = sum(ev.flops for ev in prof.key_averages() if ev.flops)
             print(f"Total FLOPs: {total_flops / 1e12:.2f} TFLOPs")
         else:
-            output_ids, pred_masks = model.evaluate(
-                image_clip,
-                image,
-                input_ids,
-                resize_list,
-                original_size_list,
-                max_new_tokens=512,
-                tokenizer=tokenizer,
-            )
+            inference_outputs = execute_inference()
 
-                # 計算コスト測定終了
         end_time = time.time()
         inference_time = end_time - start_time
         peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+        predicted_class = inference_outputs["predicted_class"]
+        pred_masks = inference_outputs["pred_masks"]
 
 
         # FLOPs計算をここに移動（推論後）
@@ -409,11 +519,14 @@ def main(args):
         print(f"Peak GPU Memory: {peak_memory:.2f} GB")
         #追加)
 
-
-        output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
-
-        text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
-        text_output = text_output.replace("\n", "").replace("  ", " ")
+        class_responses = {
+            0: "[CLS] This image is classified as real. It shows no signs of tampering or synthesis.",
+            1: "[CLS] This image is classified as full synthetic. It appears entirely artificially generated.",
+            2: "[CLS] This image is classified as tampered. It has been altered. [SEG] A mask highlighting the tampered region is provided.",
+        }
+        text_output = class_responses.get(
+            predicted_class, "[CLS] Unable to determine the manipulation status."
+        )
         print("text_output: ", text_output)
 
         for i, pred_mask in enumerate(pred_masks):

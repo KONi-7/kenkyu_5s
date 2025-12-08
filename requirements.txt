@@ -25,3 +25,4 @@ torchviz
 tensorboard
 deepspeed==0.14.0
 thop #追加
+pytest==9.0.1
