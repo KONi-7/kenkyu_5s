@@ -29,8 +29,6 @@ warnings.filterwarnings("ignore")
 
 from model.llava.model.token_pruning import prune_sequence_tensor
 
-KEEP_TOKEN_RATIO = 0.3
-
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="SIDA Model Training")
@@ -95,6 +93,12 @@ def parse_args(args):
     parser.add_argument("--test_only", action="store_true", default=False)
     parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
+    parser.add_argument(
+        "--prune_keep_ratio",
+        default=0.3,
+        type=float,
+        help="Fraction (0-1) of image tokens to retain after observe-layer pruning",
+    )
     parser.add_argument(
         "--prune_observe_layer",
         default=-24,
@@ -341,6 +345,7 @@ def main(args):
             "allgather_bucket_size": 5e8,
         },
     }
+    scheduler = None
     if not args.test_only:
         batch_sampler = BatchSampler(
             dataset=train_dataset,
@@ -363,7 +368,7 @@ def main(args):
                 cls_token_idx=args.cls_token_idx,
             ),
         )
-        # model_engine, optimizer, _, scheduler = deepspeed.initialize(
+    # model_engine, optimizer, _, scheduler = deepspeed.initialize(
         #     model=model,
         #     model_parameters=model.parameters(),
         #     config=ds_config,
@@ -571,7 +576,7 @@ def train(
             mask_dice_losses.reset()
             mask_losses.reset()
 
-        if global_step != 0:
+        if scheduler is not None and global_step != 0:
             curr_lr = scheduler.get_last_lr()
             if args.local_rank == 0:
                 writer.add_scalar("train/lr", curr_lr[0], global_step)
@@ -647,7 +652,7 @@ def test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio
                 model_engine,
                 input_dict,
                 tokenizer,
-                KEEP_TOKEN_RATIO,
+                args.prune_keep_ratio,
                 args.prune_observe_layer,
                 special_token_ids,
             )
