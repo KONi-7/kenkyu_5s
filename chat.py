@@ -406,10 +406,6 @@ def main(args):
         else:
             image = image.float()
 
-        input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-        input_ids = input_ids.unsqueeze(0).cuda()
-
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long).cuda()
         sida_model = model.module if isinstance(model, nn.DataParallel) else model
 
         special_token_ids = [
@@ -424,47 +420,54 @@ def main(args):
             if tok is not None
         ]
 
-        input_dict = {
-            "input_ids": input_ids,
-            "attention_masks": attention_mask,
-            "images_clip": image_clip,
-        }
+        def full_forward_pass():
+            local_input_ids = tokenizer_image_token(
+                prompt, tokenizer, return_tensors="pt"
+            ).unsqueeze(0).cuda()
+            local_attention_mask = torch.ones_like(
+                local_input_ids, dtype=torch.long
+            ).cuda()
 
-        if not args.disable_token_pruning:
-            input_dict = prune_batch_inputs(
-                model,
-                input_dict,
-                tokenizer,
-                keep_ratio=args.prune_keep_ratio,
-                observe_layer=args.prune_observe_layer,
-                special_token_ids=special_token_ids,
-            )
-        else:
-            input_dict.setdefault(
-                "keep_indices",
-                [torch.arange(input_ids.shape[1], device=input_ids.device)],
-            )
+            input_dict = {
+                "input_ids": local_input_ids,
+                "attention_masks": local_attention_mask,
+                "images_clip": image_clip,
+            }
 
-        input_ids = input_dict["input_ids"].to(input_ids.device)
-        attention_mask = input_dict["attention_masks"].to(attention_mask.device)
-        cached_hidden_states = input_dict.get("cached_hidden_states")
-
-        if cached_hidden_states is None:
-            with torch.inference_mode():
-                fallback = sida_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    images=image_clip,
-                    output_hidden_states=True,
-                    return_dict=True,
+            if not args.disable_token_pruning:
+                input_dict = prune_batch_inputs(
+                    model,
+                    input_dict,
+                    tokenizer,
+                    keep_ratio=args.prune_keep_ratio,
+                    observe_layer=args.prune_observe_layer,
+                    special_token_ids=special_token_ids,
                 )
-            cached_hidden_states = fallback.hidden_states[-1].detach()
+            else:
+                input_dict.setdefault(
+                    "keep_indices",
+                    [torch.arange(local_input_ids.shape[1], device=local_input_ids.device)],
+                )
 
-        def execute_inference():
+            pruned_input_ids = input_dict["input_ids"].to(local_input_ids.device)
+            pruned_attention = input_dict["attention_masks"].to(local_attention_mask.device)
+            cached_hidden_states = input_dict.get("cached_hidden_states")
+
+            if cached_hidden_states is None:
+                with torch.inference_mode():
+                    fallback = sida_model(
+                        input_ids=pruned_input_ids,
+                        attention_mask=pruned_attention,
+                        images=image_clip,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                cached_hidden_states = fallback.hidden_states[-1].detach()
+
             return run_pruned_inference(
                 sida_model=sida_model,
                 hidden_states=cached_hidden_states,
-                input_ids=input_ids,
+                input_ids=pruned_input_ids,
                 image=image,
                 resize_list=resize_list,
                 original_size_list=original_size_list,
@@ -473,6 +476,7 @@ def main(args):
         torch.cuda.reset_peak_memory_stats()
         start_time = time.time()
 
+        prof_total_flops = None
         if args.measure_flops:
             activities = [torch.profiler.ProfilerActivity.CPU]
             if torch.cuda.is_available():
@@ -483,11 +487,10 @@ def main(args):
                 profile_memory=False,
                 record_shapes=False,
             ) as prof:
-                inference_outputs = execute_inference()
-            total_flops = sum(ev.flops for ev in prof.key_averages() if ev.flops)
-            print(f"Total FLOPs: {total_flops / 1e12:.2f} TFLOPs")
+                inference_outputs = full_forward_pass()
+            prof_total_flops = sum(ev.flops for ev in prof.key_averages() if ev.flops)
         else:
-            inference_outputs = execute_inference()
+            inference_outputs = full_forward_pass()
 
         end_time = time.time()
         inference_time = end_time - start_time
@@ -498,6 +501,7 @@ def main(args):
 
 
         # FLOPs計算をここに移動（推論後）
+        language_flops = None
         try:
             llama = model.model  # LlamaModel
             llama.eval()
@@ -510,9 +514,17 @@ def main(args):
                 inputs=(dummy_input_ids,),
                 verbose=False,
             )
-            print(f"Language FLOPs: {flops / 1e12:.2f} TFLOPs")
+            language_flops = flops
         except Exception as e:
             print(f"FLOPs calculation failed: {e}")
+
+        if prof_total_flops is not None:
+            print(f"Total FLOPs: {prof_total_flops / 1e12:.2f} TFLOPs")
+        else:
+            print("Total FLOPs: unavailable (run with --measure_flops to profile end-to-end)")
+
+        if language_flops is not None:
+            print(f"Language FLOPs: {language_flops / 1e12:.2f} TFLOPs")
 
         # コスト表示
         print(f"Inference Time: {inference_time:.4f} seconds")
