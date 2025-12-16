@@ -73,6 +73,11 @@ def prune_batch_inputs(
 
     resume_outputs = pruning.get("resume_outputs")
     if resume_outputs is not None and hasattr(resume_outputs, "last_hidden_state"):
-        input_dict["cached_hidden_states"] = resume_outputs.last_hidden_state.detach()
+        cached_hidden_states = resume_outputs.last_hidden_state.detach()
+        # Some transformers/LLaVA combinations return (seq, hidden) for last_hidden_state
+        # when batch_size == 1. Downstream expects batch-first (B, seq, hidden).
+        if cached_hidden_states.dim() == 2:
+            cached_hidden_states = cached_hidden_states.unsqueeze(0)
+        input_dict["cached_hidden_states"] = cached_hidden_states
 
     return input_dict

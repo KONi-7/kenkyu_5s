@@ -402,54 +402,8 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             return torch.cat([pad, mask_flat], dim=0)
 
         assert B == len(offset) - 1
-        cls_token_mask = (input_ids[:,1:] == self.cls_token_idx)
-        cls_token_mask = torch.cat(
-            [
-                cls_token_mask,
-                torch.zeros((cls_token_mask.shape[0], 1), dtype=torch.bool, device=device),
-            ],
-            dim=1,
-        )
-        cls_token_mask = torch.cat(
-            [
-                torch.zeros((cls_token_mask.shape[0], 255), dtype=torch.bool, device=device),
-                cls_token_mask,
-            ],
-            dim=1,
-        )
-        seg_token_mask = (input_ids[:, 1:] == self.seg_token_idx)
-        seg_token_mask = torch.cat(
-            [
-                torch.zeros((seg_token_mask.shape[0], 255), dtype=torch.bool, device=device),
-                seg_token_mask,
-                torch.zeros((seg_token_mask.shape[0], 1), dtype=torch.bool, device=device),
-            ],
-            dim=1,
-        )
-
         if cached_hidden_states is not None:
-            output_hidden_states = [cached_hidden_states]
-            output = None
-        elif inference:
-            n_batch = 1
-            length = input_ids.shape[0]
-            assert images_clip.shape[0] == 1
-            images_clip_extend = images_clip.expand(length, -1, -1, -1).contiguous()
-            output_hidden_states = []
-            for i in range(n_batch):
-                start_i, end_i = i * length, min((i + 1) * length, input_ids.shape[0])
-                output_i = super().forward(
-                    images=images_clip_extend[: end_i - start_i],
-                    attention_mask=attention_masks[start_i:end_i],
-                    input_ids=input_ids[start_i:end_i],
-                    output_hidden_states=True,
-                )
-                output_hidden_states.append(output_i.hidden_states)
-                torch.cuda.empty_cache()
-            output_hidden_states_list = []
-            output_hidden_states_level = torch.cat(output_hidden_states, dim=0)
-            output_hidden_states_list.append(output_hidden_states_level)
-            output_hidden_states = output_hidden_states_list
+            output_hidden_states = cached_hidden_states
             output = None
         else:
             images_clip_list = []
@@ -463,27 +417,59 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
                 )
                 images_clip_list.append(images_clip_i)
             images_clip = torch.cat(images_clip_list, dim=0) #[2,3,224,224]
-            output = super().forward(
+            forward_kwargs = dict(
                 images=images_clip,
                 attention_mask=attention_masks,
                 input_ids=input_ids,
-                labels = labels,
                 output_hidden_states=True,
             )
+            if not inference:
+                forward_kwargs["labels"] = labels
+
+            output = super().forward(**forward_kwargs)
             output_hidden_states = output.hidden_states
-            # Geting cls information
+
+        # Getting cls information
         assert len(self.model.cls_head) == 1
-        last_layer_hidden = output_hidden_states[-1]
-        cls_token_mask = _align_mask_length(cls_token_mask, last_layer_hidden.shape[1])
-        seg_token_mask = _align_mask_length(seg_token_mask, last_layer_hidden.shape[1])
+        if isinstance(output_hidden_states, (list, tuple)):
+            last_layer_hidden = output_hidden_states[-1]
+        else:
+            last_layer_hidden = output_hidden_states
+
+        # Some transformer wrappers / versions may return hidden states without an explicit
+        # batch dimension when batch_size == 1 (shape: [seq, hidden]). Normalize to [B, S, H].
+        if isinstance(last_layer_hidden, torch.Tensor) and last_layer_hidden.dim() == 2:
+            last_layer_hidden = last_layer_hidden.unsqueeze(0)
+
+        bs = last_layer_hidden.shape[0]
+        seq_len_out = last_layer_hidden.shape[1]
+        seq_len_in = input_ids.shape[1]
+        delta = seq_len_out - seq_len_in
+
+        cls_token_mask_in = (input_ids == self.cls_token_idx)
+        has_cls = cls_token_mask_in.any(dim=1)
+        cls_pos = torch.zeros(bs, dtype=torch.long, device=last_layer_hidden.device)
+        if has_cls.any():
+            cls_pos[has_cls] = cls_token_mask_in[has_cls].int().argmax(dim=1)
+
+        if delta != 0:
+            img_token_mask = (input_ids == IMAGE_TOKEN_INDEX)
+            has_img = img_token_mask.any(dim=1)
+            img_pos = torch.zeros(bs, dtype=torch.long, device=last_layer_hidden.device)
+            if has_img.any():
+                img_pos[has_img] = img_token_mask[has_img].int().argmax(dim=1)
+            shift = (cls_pos > img_pos) & has_img
+            cls_pos = cls_pos + shift.long() * delta
+
+        cls_pos = cls_pos.clamp_(0, seq_len_out - 1)
 
         last_hidden_state_cls = self.model.cls_head[0](last_layer_hidden)
+        logits = last_hidden_state_cls[
+            torch.arange(bs, device=last_layer_hidden.device), cls_pos, :
+        ]
 
-        cls_logits_flat = last_hidden_state_cls.view(-1, last_hidden_state_cls.shape[-1])
-        cls_mask_flat = _match_mask_to_logits(cls_token_mask, cls_logits_flat)
-        cls_result = cls_logits_flat[cls_mask_flat]
+        seg_has_any = (input_ids == self.seg_token_idx).any().item()
 
-        logits = cls_result
         loss_fct = nn.CrossEntropyLoss()
         cls_loss = loss_fct(logits, cls_labels)
 
@@ -491,29 +477,42 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
         mask_bce_loss = mask_dice_loss = mask_loss = torch.tensor(0.0, device=cls_loss.device)
         num_masks = 0
         if (cls_labels == 2).any():
-            hidden_states = []
-            hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
-            last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            last_hidden_state = self.model.text_hidden_fcs[0](last_layer_hidden)
 
-            last_hidden_state_flat = last_hidden_state.reshape(-1, last_hidden_state.shape[-1])
-            seg_mask_flat = _match_mask_to_logits(seg_token_mask, last_hidden_state_flat)
-            pred_embeddings = last_hidden_state_flat[seg_mask_flat]
-            seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-            seg_token_offset = seg_token_counts.cumsum(-1)
-            seg_token_offset = torch.cat(
-            [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
-            )
-            try:
-                seg_token_offset = seg_token_offset[offset]
-            except Exception as e:
-                print(f"Error when applying offset to seg_token_offset: {e}")
-            pred_embeddings_ = []
-            for i in range(len(seg_token_offset) - 1):
-                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-                pred_embeddings_.append(pred_embeddings[start_i:end_i])
-            pred_embeddings = pred_embeddings_
+            # Build [SEG] embeddings per sample, then group them per image via `offset`.
+            seg_token_mask_in = (input_ids == self.seg_token_idx)
+            img_token_mask = (input_ids == IMAGE_TOKEN_INDEX)
+            has_img = img_token_mask.any(dim=1)
+            img_pos = torch.zeros(bs, dtype=torch.long, device=last_layer_hidden.device)
+            if delta != 0 and has_img.any():
+                img_pos[has_img] = img_token_mask[has_img].int().argmax(dim=1)
+
+            per_sample_seg_embeds = []
+            for b in range(bs):
+                seg_pos_in = torch.nonzero(seg_token_mask_in[b], as_tuple=False).squeeze(1)
+                if seg_pos_in.numel() == 0:
+                    per_sample_seg_embeds.append(
+                        torch.zeros((0, last_hidden_state.shape[-1]), device=last_layer_hidden.device, dtype=last_hidden_state.dtype)
+                    )
+                    continue
+
+                seg_pos_out = seg_pos_in
+                if delta != 0 and has_img[b]:
+                    seg_pos_out = seg_pos_in + (seg_pos_in > img_pos[b]).long() * delta
+                seg_pos_out = seg_pos_out.clamp(0, seq_len_out - 1)
+                per_sample_seg_embeds.append(last_hidden_state[b, seg_pos_out, :])
+
+            pred_embeddings = []
+            for i in range(len(offset) - 1):
+                start_i, end_i = offset[i].item(), offset[i + 1].item()
+                if end_i <= start_i:
+                    pred_embeddings.append(
+                        torch.zeros((0, last_hidden_state.shape[-1]), device=last_layer_hidden.device, dtype=last_hidden_state.dtype)
+                    )
+                else:
+                    pred_embeddings.append(torch.cat(per_sample_seg_embeds[start_i:end_i], dim=0))
             #Attention
-            cls_projected = self.model.sida_fc1(cls_result)
+            cls_projected = self.model.sida_fc1(logits)
             enhanced_pred_embeddings = []
             for i in range(len(pred_embeddings)):
                 seg_embeddings = pred_embeddings[i]
@@ -596,7 +595,7 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             mask_dice_loss = torch.tensor(0.0, device=cls_loss.device)
             mask_loss = torch.tensor(0.0, device=cls_loss.device)
 
-        if not inference and seg_token_mask.sum() == 0:  
+        if not inference and not seg_has_any:
             dummy = torch.zeros([], device=cls_loss.device) 
             for p in itertools.chain(
                 self.model.visual_model.mask_decoder.parameters(),
@@ -614,7 +613,7 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             "mask_loss": mask_loss,
             "cls_loss": cls_loss,
             "logits": logits,
-            "cls_hidden_state": cls_result, 
+            "cls_hidden_state": logits,
         }
 
     def evaluate(

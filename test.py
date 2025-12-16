@@ -29,6 +29,8 @@ warnings.filterwarnings("ignore")
 
 from model.llava.model.token_pruning import prune_sequence_tensor
 
+KEEP_TOKEN_RATIO = 0.3
+
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="SIDA Model Training")
@@ -94,16 +96,22 @@ def parse_args(args):
     parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument(
-        "--prune_keep_ratio",
-        default=0.3,
-        type=float,
-        help="Fraction (0-1) of image tokens to retain after observe-layer pruning",
-    )
-    parser.add_argument(
         "--prune_observe_layer",
         default=-24,
         type=int,
         help="Layer index (can be negative) up to which we run observe-phase before pruning",
+    )
+    parser.add_argument(
+        "--prune_keep_ratio",
+        default=KEEP_TOKEN_RATIO,
+        type=float,
+        help="Token keep ratio for pruning (0-1). Use 1.0 to disable pruning.",
+    )
+    parser.add_argument(
+        "--disable_token_pruning",
+        action="store_true",
+        default=False,
+        help="Disable token pruning during evaluation (equivalent to --prune_keep_ratio 1.0).",
     )
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--print_freq", default=1, type=int)
@@ -345,7 +353,6 @@ def main(args):
             "allgather_bucket_size": 5e8,
         },
     }
-    scheduler = None
     if not args.test_only:
         batch_sampler = BatchSampler(
             dataset=train_dataset,
@@ -368,7 +375,7 @@ def main(args):
                 cls_token_idx=args.cls_token_idx,
             ),
         )
-    # model_engine, optimizer, _, scheduler = deepspeed.initialize(
+        # model_engine, optimizer, _, scheduler = deepspeed.initialize(
         #     model=model,
         #     model_parameters=model.parameters(),
         #     config=ds_config,
@@ -576,7 +583,7 @@ def train(
             mask_dice_losses.reset()
             mask_losses.reset()
 
-        if scheduler is not None and global_step != 0:
+        if global_step != 0:
             curr_lr = scheduler.get_last_lr()
             if args.local_rank == 0:
                 writer.add_scalar("train/lr", curr_lr[0], global_step)
@@ -605,21 +612,50 @@ def test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio
     target_meter = AverageMeter("Target", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
 
-    # Calculate total number of batches and samples to use
-    total_batches = len(test_loader)
+    # Fast sampling: build a sampled subset loader so we don't iterate the full test set.
+    sample_indices = None
     if sample_ratio is not None:
-        num_batches = max(1, int(total_batches * sample_ratio))
-        # Generate random indices for sampling
-        sample_indices = set(random.sample(range(total_batches), num_batches))
-        print(f"\ntest on {num_batches}/{total_batches} randomly sampled batches...")
+        try:
+            dataset = test_loader.dataset
+            total_samples = len(dataset)
+            sample_size = max(1, int(total_samples * float(sample_ratio)))
+            rng = random.Random(0)
+            indices = rng.sample(range(total_samples), sample_size)
+
+            from torch.utils.data import DataLoader, Subset
+
+            subset = Subset(dataset, indices)
+
+            test_loader = DataLoader(
+                subset,
+                # NOTE: the original `test_loader` is built with a `batch_sampler`,
+                # so `test_loader.batch_size` is `None`. Passing `None` here disables
+                # auto-collation and breaks our `collate_fn` (it expects a list).
+                batch_size=int(getattr(args, "test_batch_size", 1)),
+                shuffle=False,
+                # Avoid multiprocessing here: `collate_fn` carries a tokenizer via `partial`,
+                # and some environments can mis-handle it under worker processes.
+                num_workers=0,
+                pin_memory=getattr(test_loader, "pin_memory", False),
+                collate_fn=getattr(test_loader, "collate_fn", None),
+                drop_last=False,
+            )
+            print(
+                f"\ntest on {sample_size}/{total_samples} samples (ratio={sample_ratio}) using a sampled subset loader..."
+            )
+        except Exception as exc:
+            print(f"Sampling subset loader failed ({exc}); falling back to batch-skipping sampling.")
+            total_batches = len(test_loader)
+            num_batches = max(1, int(total_batches * float(sample_ratio)))
+            sample_indices = set(random.sample(range(total_batches), num_batches))
+            print(f"test on {num_batches}/{total_batches} randomly sampled batches...")
 
     # Lists for AUC and PR computation (pixel-wise) for tampered masks
     all_mask_scores = []
     all_mask_labels = []
 
     for batch_idx, input_dict in enumerate(tqdm.tqdm(test_loader)):
-        # Skip batches not in our sample if sampling is enabled
-        if sample_ratio is not None and batch_idx not in sample_indices:
+        if sample_indices is not None and batch_idx not in sample_indices:
             continue
         if batch_idx == 0:
             print("\nFirst test batch details:")
@@ -647,18 +683,24 @@ def test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio
             input_dict["images"] = input_dict["images"].float()
             input_dict["images_clip"] = input_dict["images_clip"].float()
 
-        try:
-            input_dict = prune_batch_inputs(
-                model_engine,
-                input_dict,
-                tokenizer,
-                args.prune_keep_ratio,
-                args.prune_observe_layer,
-                special_token_ids,
-            )
-        except RuntimeError as exc:
-            if batch_idx == 0:
-                print(f"Token pruning skipped due to error: {exc}")
+        do_prune = (not getattr(args, "disable_token_pruning", False)) and (
+            float(getattr(args, "prune_keep_ratio", KEEP_TOKEN_RATIO)) < 1.0
+        )
+        if do_prune:
+            try:
+                input_dict = prune_batch_inputs(
+                    model_engine,
+                    input_dict,
+                    tokenizer,
+                    float(getattr(args, "prune_keep_ratio", KEEP_TOKEN_RATIO)),
+                    args.prune_observe_layer,
+                    special_token_ids,
+                )
+            except RuntimeError as exc:
+                if batch_idx == 0:
+                    print(f"Token pruning skipped due to error: {exc}")
+        elif batch_idx == 0:
+            print("Token pruning disabled: running full sequence for all layers")
 
         input_dict['inference'] = True
         with torch.no_grad():

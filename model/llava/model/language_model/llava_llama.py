@@ -105,134 +105,104 @@ if not hasattr(hf_llama, "_llava_rope_patched"):
     hf_llama.apply_rotary_pos_emb = _apply_rotary_with_logging
     hf_llama._llava_rope_patched = True
 
-if not hasattr(hf_llama, "_llava_rotary_forward_patched"):
-    _original_rotary_forward = hf_llama.LlamaRotaryEmbedding.forward
-    _rotary_forward_signature = inspect.signature(_original_rotary_forward)
-    _rotary_params = tuple(_rotary_forward_signature.parameters.values())
-    _rotary_accepts_seq_len_kw = any(
-        param.kind in (inspect.Parameter.VAR_KEYWORD,)
-        or param.name == "seq_len"
-        for param in _rotary_params
-    )
-
-    def _llava_rotary_forward(self, x, *args, **kwargs):
-        if "seq_len" in kwargs and not _rotary_accepts_seq_len_kw:
-            seq_len_value = kwargs["seq_len"]
-            filtered_kwargs = kwargs.copy()
-            filtered_kwargs.pop("seq_len", None)
-            if len(args) == 0:
-                try:
-                    return _original_rotary_forward(self, x, seq_len_value, **filtered_kwargs)
-                except TypeError:
-                    pass
-            return _original_rotary_forward(self, x, *args, **filtered_kwargs)
-
-        return _original_rotary_forward(self, x, *args, **kwargs)
-
-    hf_llama.LlamaRotaryEmbedding.forward = _llava_rotary_forward
-    hf_llama._llava_rotary_forward_patched = True
-
 if not hasattr(hf_llama, "_llava_attention_forward_patched"):
 
-    def _llava_attention_forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[torch.Tensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ):
-        cos, sin = position_embeddings
-        expected_seq_len = cos.shape[-2] if cos is not None else None
-
-        if hidden_states.dim() == 1:
-            hidden_states = hidden_states.unsqueeze(0).unsqueeze(0)
-
-        if hidden_states.dim() == 2:
-            hidden_states = hidden_states.unsqueeze(0)
-            if attention_mask is not None and attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(0)
-
-        if (
-            hidden_states.dim() == 3
-            and expected_seq_len is not None
-            and hidden_states.shape[1] != expected_seq_len
-            and hidden_states.shape[0] == expected_seq_len
-        ):
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
-
-        if hidden_states.dim() != 3:
-            raise ValueError(
-                f"Expected hidden_states with 3 dims (batch, seq, hidden), got shape={tuple(hidden_states.shape)}"
-            )
-
-        bsz, q_len, _ = hidden_states.size()
-        num_heads = self.config.num_attention_heads
-        num_kv_heads = self.config.num_key_value_heads
-        head_dim = self.head_dim
-
-        def _shape(states: torch.Tensor, num_heads_local: int):
-            return (
-                states.view(bsz, q_len, num_heads_local, head_dim)
-                .transpose(1, 2)
-                .contiguous()
-            )
-
-        query_states = _shape(self.q_proj(hidden_states), num_heads)
-        key_states = _shape(self.k_proj(hidden_states), num_kv_heads)
-        value_states = _shape(self.v_proj(hidden_states), num_kv_heads)
-
-        if key_states.shape[2] != value_states.shape[2] and not hasattr(self, "_warned_value_seq_len"):
-            logger.warning(
-                "Layer %s detected mismatch between key/value seq dim: key=%s value=%s hidden=%s",
-                getattr(self, "layer_idx", -1),
-                tuple(key_states.shape),
-                tuple(value_states.shape),
-                tuple(hidden_states.shape),
-            )
-            self._warned_value_seq_len = True
-
-        query_states, key_states = hf_llama.apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-
-        output_attentions = kwargs.pop("output_attentions", False)
-        kwargs.pop("use_cache", None)
-        kwargs.pop("position_ids", None)
-
-        attention_interface: Callable = hf_llama.eager_attention_forward
-        attn_impl = getattr(self.config, "_attn_implementation", "eager")
-        if attn_impl != "eager":
-            attention_interface = hf_llama.ALL_ATTENTION_FUNCTIONS[attn_impl]
-
-        attention_kwargs = {
-            "dropout": 0.0 if not self.training else self.attention_dropout,
-            "scaling": self.scaling,
-            "output_attentions": output_attentions,
-        }
-        attention_kwargs.update(kwargs)
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            **attention_kwargs,
+    # Newer `transformers` versions provide `eager_attention_forward` and an
+    # attention-implementation registry. If they're missing, don't patch
+    # attention at import-time; keep the stock implementation.
+    if not hasattr(hf_llama, "eager_attention_forward") or not hasattr(hf_llama, "ALL_ATTENTION_FUNCTIONS"):
+        logger.warning(
+            "Transformers version lacks `eager_attention_forward`/`ALL_ATTENTION_FUNCTIONS`; skipping LLaVA attention patch."
         )
+        hf_llama._llava_attention_forward_patched = True
+    else:
 
-        if output_attentions and attn_weights is None and attn_impl != "eager":
-            logger.warning(
-                "Attention implementation '%s' returned no attention weights; rerunning layer %s with eager attention for pruning support.",
-                attn_impl,
-                getattr(self, "layer_idx", -1),
+        def _llava_attention_forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: tuple,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[torch.Tensor] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs,
+        ):
+            cos, sin = position_embeddings
+            expected_seq_len = cos.shape[-2] if cos is not None else None
+
+            if hidden_states.dim() == 1:
+                hidden_states = hidden_states.unsqueeze(0).unsqueeze(0)
+
+            if hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
+                if attention_mask is not None and attention_mask.dim() == 3:
+                    attention_mask = attention_mask.unsqueeze(0)
+
+            if (
+                hidden_states.dim() == 3
+                and expected_seq_len is not None
+                and hidden_states.shape[1] != expected_seq_len
+                and hidden_states.shape[0] == expected_seq_len
+            ):
+                hidden_states = hidden_states.transpose(0, 1).contiguous()
+
+            if hidden_states.dim() != 3:
+                raise ValueError(
+                    f"Expected hidden_states with 3 dims (batch, seq, hidden), got shape={tuple(hidden_states.shape)}"
+                )
+
+            bsz, q_len, _ = hidden_states.size()
+            num_heads = self.config.num_attention_heads
+            num_kv_heads = self.config.num_key_value_heads
+            head_dim = self.head_dim
+
+            def _shape(states: torch.Tensor, num_heads_local: int):
+                return (
+                    states.view(bsz, q_len, num_heads_local, head_dim)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+
+            query_states = _shape(self.q_proj(hidden_states), num_heads)
+            key_states = _shape(self.k_proj(hidden_states), num_kv_heads)
+            value_states = _shape(self.v_proj(hidden_states), num_kv_heads)
+
+            position_ids = kwargs.pop("position_ids", None)
+
+            if key_states.shape[2] != value_states.shape[2] and not hasattr(self, "_warned_value_seq_len"):
+                logger.warning(
+                    "Layer %s detected mismatch between key/value seq dim: key=%s value=%s hidden=%s",
+                    getattr(self, "layer_idx", -1),
+                    tuple(key_states.shape),
+                    tuple(value_states.shape),
+                    tuple(hidden_states.shape),
+                )
+                self._warned_value_seq_len = True
+
+            query_states, key_states = hf_llama.apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids=position_ids
             )
-            attention_interface = hf_llama.eager_attention_forward
+
+            if past_key_values is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+
+            output_attentions = kwargs.pop("output_attentions", False)
+            kwargs.pop("use_cache", None)
+
+            attention_interface: Callable = hf_llama.eager_attention_forward
+            attn_impl = getattr(self.config, "_attn_implementation", "eager")
+            if attn_impl != "eager":
+                attention_interface = hf_llama.ALL_ATTENTION_FUNCTIONS[attn_impl]
+
+            attention_kwargs = {
+                "dropout": 0.0 if not self.training else self.attention_dropout,
+                "scaling": self.scaling,
+                "output_attentions": output_attentions,
+            }
+            attention_kwargs.update(kwargs)
+
             attn_output, attn_weights = attention_interface(
                 self,
                 query_states,
@@ -241,22 +211,38 @@ if not hasattr(hf_llama, "_llava_attention_forward_patched"):
                 attention_mask,
                 **attention_kwargs,
             )
-            if getattr(self.config, "_attn_implementation", None) != "eager":
-                setattr(self.config, "_attn_implementation", "eager")
-            if getattr(self.config, "attn_implementation", None) != "eager":
-                setattr(self.config, "attn_implementation", "eager")
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, num_heads * head_dim)
-        attn_output = self.o_proj(attn_output)
+            if output_attentions and attn_weights is None and attn_impl != "eager":
+                logger.warning(
+                    "Attention implementation '%s' returned no attention weights; rerunning layer %s with eager attention for pruning support.",
+                    attn_impl,
+                    getattr(self, "layer_idx", -1),
+                )
+                attention_interface = hf_llama.eager_attention_forward
+                attn_output, attn_weights = attention_interface(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    **attention_kwargs,
+                )
+                if getattr(self.config, "_attn_implementation", None) != "eager":
+                    setattr(self.config, "_attn_implementation", "eager")
+                if getattr(self.config, "attn_implementation", None) != "eager":
+                    setattr(self.config, "attn_implementation", "eager")
 
-        if not output_attentions:
-            attn_weights = None
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, num_heads * head_dim)
+            attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights
+            if not output_attentions:
+                attn_weights = None
 
-    hf_llama.LlamaAttention.forward = _llava_attention_forward
-    hf_llama._llava_attention_forward_patched = True
+            return attn_output, attn_weights
+
+        hf_llama.LlamaAttention.forward = _llava_attention_forward
+        hf_llama._llava_attention_forward_patched = True
 
 
 def _make_causal_mask(
@@ -451,8 +437,34 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
         early_stop_triggered = False
 
         position_embeddings = None
-        if hasattr(self, "rotary_emb") and position_ids is not None:
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        if position_ids is not None:
+            rotary_source = getattr(self, "rotary_emb", None)
+            if rotary_source is None and len(self.layers) > 0:
+                rotary_source = getattr(self.layers[0].self_attn, "rotary_emb", None)
+
+            if rotary_source is not None:
+                seq_len = int(position_ids.detach().max().item()) + 1
+                # transformers versions differ in LlamaRotaryEmbedding.forward signature:
+                # - forward(x, seq_len=...)
+                # - forward(x, position_ids)
+                try:
+                    param_names = set(inspect.signature(rotary_source.forward).parameters.keys())
+                except (TypeError, ValueError):
+                    param_names = set()
+
+                if "seq_len" in param_names:
+                    position_embeddings = rotary_source(hidden_states, seq_len=seq_len)
+                elif "position_ids" in param_names:
+                    position_embeddings = rotary_source(hidden_states, position_ids)
+                else:
+                    # Fallback for unknown signatures.
+                    try:
+                        position_embeddings = rotary_source(hidden_states, seq_len=seq_len)
+                    except TypeError:
+                        try:
+                            position_embeddings = rotary_source(hidden_states, seq_len)
+                        except TypeError:
+                            position_embeddings = rotary_source(hidden_states, position_ids)
 
         for idx in range(layer_start, num_layers):
             decoder_layer = self.layers[idx]

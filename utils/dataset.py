@@ -233,11 +233,12 @@ class CustomDataset(torch.utils.data.Dataset):
 
         self.images.extend(real_images)
         self.images.extend(full_syn_images)
-        self.images.extend(obj_part_syn_images)
+        # Only include tampered/object_part images that have masks.
+        self.images.extend(valid_obj_part_syn_images)
         
         self.labels.extend([0] * len(real_images))
         self.labels.extend([1] * len(full_syn_images))
-        self.labels.extend([2] * len(obj_part_syn_images))
+        self.labels.extend([2] * len(valid_obj_part_syn_images))
          # Print dataset statistics
         print(f"\nDataset Statistics for {split} split:")
         print(f"Real images: {len(real_images)}")
