@@ -519,16 +519,72 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
             layer_input_states = hidden_states
 
+            # Transformers version compatibility:
+            # Some versions of LlamaDecoderLayer/LlamaAttention do not accept
+            # `position_embeddings` and/or `cache_position`. Gate these kwargs
+            # by signature to avoid unexpected keyword argument errors.
+            layer_supports_position_embeddings = getattr(
+                decoder_layer, "_supports_position_embeddings", None
+            )
+            if layer_supports_position_embeddings is None:
+                try:
+                    layer_supports_position_embeddings = (
+                        "position_embeddings"
+                        in inspect.signature(decoder_layer.forward).parameters
+                    )
+                except Exception:
+                    layer_supports_position_embeddings = False
+                setattr(
+                    decoder_layer,
+                    "_supports_position_embeddings",
+                    layer_supports_position_embeddings,
+                )
+
+            attn_supports_position_embeddings = getattr(
+                decoder_layer.self_attn, "_supports_position_embeddings", None
+            )
+            if attn_supports_position_embeddings is None:
+                try:
+                    attn_supports_position_embeddings = (
+                        "position_embeddings"
+                        in inspect.signature(decoder_layer.self_attn.forward).parameters
+                    )
+                except Exception:
+                    attn_supports_position_embeddings = False
+                setattr(
+                    decoder_layer.self_attn,
+                    "_supports_position_embeddings",
+                    attn_supports_position_embeddings,
+                )
+
+            attn_supports_cache_position = getattr(
+                decoder_layer.self_attn, "_supports_cache_position", None
+            )
+            if attn_supports_cache_position is None:
+                try:
+                    attn_supports_cache_position = (
+                        "cache_position"
+                        in inspect.signature(decoder_layer.self_attn.forward).parameters
+                    )
+                except Exception:
+                    attn_supports_cache_position = False
+                setattr(
+                    decoder_layer.self_attn,
+                    "_supports_cache_position",
+                    attn_supports_cache_position,
+                )
+
             if self.gradient_checkpointing and self.training:
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
-                        return module(
-                            *inputs,
-                            output_attentions=layer_requires_attn,
-                            use_cache=False,
-                            position_embeddings=layer_position_embeddings,
-                        )
+                        kwargs = {
+                            "output_attentions": layer_requires_attn,
+                            "use_cache": False,
+                        }
+                        if layer_supports_position_embeddings:
+                            kwargs["position_embeddings"] = layer_position_embeddings
+                        return module(*inputs, **kwargs)
 
                     return custom_forward
 
@@ -540,15 +596,16 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
                     None,
                 )
             else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=layer_requires_attn,
-                    use_cache=use_cache,
-                    position_embeddings=layer_position_embeddings,
-                )
+                layer_kwargs = {
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "past_key_value": past_key_value,
+                    "output_attentions": layer_requires_attn,
+                    "use_cache": use_cache,
+                }
+                if layer_supports_position_embeddings:
+                    layer_kwargs["position_embeddings"] = layer_position_embeddings
+                layer_outputs = decoder_layer(hidden_states, **layer_kwargs)
 
             hidden_states = layer_outputs[0]
 
@@ -564,16 +621,18 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
                         "Decoder layer %s did not return attention weights; computing them manually via self-attention.",
                         getattr(decoder_layer.self_attn, "layer_idx", -1),
                     )
-                    self_attn_outputs = decoder_layer.self_attn(
-                        layer_input_states,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_value,
-                        output_attentions=True,
-                        use_cache=use_cache,
-                        cache_position=None,
-                        position_embeddings=layer_position_embeddings,
-                    )
+                    attn_kwargs = {
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "past_key_value": past_key_value,
+                        "output_attentions": True,
+                        "use_cache": use_cache,
+                    }
+                    if attn_supports_cache_position:
+                        attn_kwargs["cache_position"] = None
+                    if attn_supports_position_embeddings:
+                        attn_kwargs["position_embeddings"] = layer_position_embeddings
+                    self_attn_outputs = decoder_layer.self_attn(layer_input_states, **attn_kwargs)
                     if isinstance(self_attn_outputs, tuple) and len(self_attn_outputs) >= 2:
                         attn_weights = self_attn_outputs[1]
                     else:

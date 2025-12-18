@@ -192,6 +192,9 @@ def run_pruned_inference(
     image: torch.Tensor,
     resize_list,
     original_size_list,
+    *,
+    force_predicted_class: int | None = None,
+    force_cls_result: torch.Tensor | None = None,
 ):
     device = input_ids.device
     bs = last_layer_hidden.shape[0]
@@ -223,6 +226,8 @@ def run_pruned_inference(
 
     # Predicted class from the last [CLS] (batch-size assumed 1 for interactive chat).
     predicted_class = int(torch.argmax(cls_result[0], dim=-1).item())
+    if force_predicted_class is not None:
+        predicted_class = int(force_predicted_class)
 
     pred_masks = []
     if predicted_class == 2:
@@ -253,7 +258,8 @@ def run_pruned_inference(
             # Interactive chat uses batch size 1; keep list-of-tensors structure.
             pred_embeddings = per_sample_seg_embeds
 
-            cls_projected = sida_model.model.sida_fc1(cls_result)
+            cls_for_attn = force_cls_result if force_cls_result is not None else cls_result
+            cls_projected = sida_model.model.sida_fc1(cls_for_attn)
             enhanced_pred_embeddings = []
             for i in range(len(pred_embeddings)):
                 if pred_embeddings[i].shape[0] == 0:
@@ -433,16 +439,27 @@ def main(args):
         except (EOFError, KeyboardInterrupt):
             print("\nExiting chat.")
             break
-        prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
+        # Align chat inference prompt format with the evaluation/training conversations.
+        # In the dataset pipeline, [CLS]/[SEG] appear in the *assistant* response, and the model
+        # derives segmentation queries from the *input* token positions of [SEG] (teacher forcing).
+        # To avoid degraded mask quality from a context-free, user-appended [SEG], we:
+        # - Always add an assistant-side "[CLS]" token for classification.
+        # - If (and only if) the model predicts tampered, run a second forward pass with an
+        #   assistant-side tampered template ending in "[SEG]" to extract a meaningful seg embedding.
+        question_text = (prompt or "").strip()
+        if not question_text:
+            question_text = (
+                "Can you identify if this image is real, full synthetic, or tampered image? "
+                "Please mask the tampered regions if it is tampered."
+            )
+        conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{question_text}")
+        conv.append_message(conv.roles[1], "[CLS]")
+        prompt = conv.get_prompt()
         if args.use_mm_start_end:
             replace_token = (
                 DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
             )
             prompt = prompt.replace(DEFAULT_IMAGE_TOKEN, replace_token)
-
-        conv.append_message(conv.roles[0], prompt)
-        conv.append_message(conv.roles[1], "")
-        prompt = conv.get_prompt()
 
         try:
             image_path = input("Please input the image path: ")
@@ -570,7 +587,8 @@ def main(args):
                         f"Unexpected cached_hidden_states shape: {tuple(cached_hidden_states.shape)}"
                     )
 
-                return run_pruned_inference(
+                # 1) Classification pass: prompt includes assistant-side [CLS] only.
+                out = run_pruned_inference(
                     sida_model=sida_model,
                     last_layer_hidden=cached_hidden_states,
                     input_ids=run_input_ids,
@@ -578,6 +596,60 @@ def main(args):
                     resize_list=resize_list,
                     original_size_list=original_size_list,
                 )
+
+                # 2) If tampered, run a second forward pass with an assistant-side tampered template
+                # ending in [SEG] to obtain a meaningful seg embedding (matches SID_Set.py).
+                if int(out["predicted_class"]) == 2:
+                    seg_conv = conversation_lib.conv_templates[args.conv_type].copy()
+                    seg_conv.messages = []
+                    seg_conv.append_message(seg_conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{question_text}")
+                    seg_conv.append_message(seg_conv.roles[1], "[CLS] The image is tampered [SEG]")
+                    seg_prompt = seg_conv.get_prompt()
+                    if args.use_mm_start_end:
+                        seg_prompt = seg_prompt.replace(DEFAULT_IMAGE_TOKEN, replace_token)
+
+                    seg_input_ids = tokenizer_image_token(
+                        seg_prompt, tokenizer, return_tensors="pt"
+                    ).unsqueeze(0).to(device)
+                    seg_attention_mask = torch.ones_like(seg_input_ids, dtype=torch.long).to(device)
+
+                    fallback_seg = LlavaLlamaForCausalLM.forward(
+                        sida_model,
+                        input_ids=seg_input_ids,
+                        attention_mask=seg_attention_mask,
+                        images=image_clip,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    seg_hidden = _extract_last_layer_hidden_states(fallback_seg).detach()
+
+                    # Normalize hidden states shape to batch-first (B, seq, hidden).
+                    if not isinstance(seg_hidden, torch.Tensor):
+                        raise RuntimeError(
+                            f"seg_hidden must be a Tensor, got {type(seg_hidden)}"
+                        )
+                    if seg_hidden.dim() == 2:
+                        seg_hidden = seg_hidden.unsqueeze(0)
+                    elif seg_hidden.dim() == 4:
+                        seg_hidden = seg_hidden[-1]
+                    if seg_hidden.dim() != 3:
+                        raise RuntimeError(
+                            f"Unexpected seg_hidden shape: {tuple(seg_hidden.shape)}"
+                        )
+
+                    seg_out = run_pruned_inference(
+                        sida_model=sida_model,
+                        last_layer_hidden=seg_hidden,
+                        input_ids=seg_input_ids,
+                        image=image,
+                        resize_list=resize_list,
+                        original_size_list=original_size_list,
+                        force_predicted_class=2,
+                        force_cls_result=out["logits"],
+                    )
+                    out["pred_masks"] = seg_out["pred_masks"]
+
+                return out
 
         cuda_device_ids = _get_cuda_device_ids_for_peak(model, device)
         if device.type == "cuda" and cuda_device_ids:
