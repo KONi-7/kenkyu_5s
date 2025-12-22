@@ -9,16 +9,98 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor
-from thop import profile #追加
 import torch.profiler  # 追加
 
 from model.SIDA import SIDAForCausalLM
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
+from model.llava.model.language_model.llava_llama import LlavaLlamaForCausalLM
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_TOKEN)
+                         DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
 from utils.pruning import prune_batch_inputs
+
+
+def _extract_last_layer_hidden_states(fallback_output) -> torch.Tensor:
+    """Extract last-layer hidden states from various HF/custom output shapes."""
+    hidden_states = getattr(fallback_output, "hidden_states", None)
+    if hidden_states is None:
+        raise RuntimeError("Fallback forward did not return hidden_states")
+
+    # Some implementations return a tuple/list of per-layer tensors.
+    if isinstance(hidden_states, (tuple, list)):
+        if len(hidden_states) == 0:
+            raise RuntimeError("Fallback forward returned empty hidden_states")
+        last = hidden_states[-1]
+        if not isinstance(last, torch.Tensor):
+            raise RuntimeError(
+                f"Unexpected hidden_states[-1] type: {type(last)}"
+            )
+        return last
+
+    # Other implementations may return a single tensor (already last hidden).
+    if isinstance(hidden_states, torch.Tensor):
+        return hidden_states
+
+    raise RuntimeError(f"Unexpected hidden_states type: {type(hidden_states)}")
+
+
+def _sum_profiled_flops(prof: torch.profiler.profile) -> int:
+    """Sum FLOPs reported by torch.profiler (may be partial depending on kernels)."""
+    total_flops = 0
+    for ev in prof.key_averages():
+        f = getattr(ev, "flops", None)
+        if f:
+            total_flops += int(f)
+    return total_flops
+
+
+def _format_flops(flops: int) -> str:
+    units = ["FLOPs", "KFLOPs", "MFLOPs", "GFLOPs", "TFLOPs", "PFLOPs"]
+    x = float(flops)
+    for u in units:
+        if x < 1000.0:
+            return f"{x:.2f} {u}"
+        x /= 1000.0
+    return f"{x:.2f} EFLOPs"
+
+
+def _get_cuda_device_ids_for_peak(model: nn.Module, device: torch.device) -> list[int]:
+    """Return CUDA device ids to consider when reporting peak GPU memory."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return []
+    if isinstance(model, nn.DataParallel):
+        # DataParallel keeps a replica on each device_id.
+        return list(getattr(model, "device_ids", []) or [torch.cuda.current_device()])
+    return [torch.cuda.current_device()]
+
+
+def _reset_peak_cuda_memory_stats(device_ids: list[int]) -> None:
+    for dev in device_ids:
+        try:
+            torch.cuda.reset_peak_memory_stats(dev)
+        except Exception:
+            # Best-effort: if CUDA isn't fully initialized for a device, skip.
+            pass
+
+
+def _peak_cuda_memory_gb(device_ids: list[int]) -> float:
+    if not device_ids:
+        return 0.0
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    peaks = []
+    for dev in device_ids:
+        try:
+            peaks.append(float(torch.cuda.max_memory_allocated(dev)))
+        except Exception:
+            pass
+    if not peaks:
+        return 0.0
+    # Report the max across devices (single headline number).
+    return max(peaks) / (1024 ** 3)
 
 
 
@@ -60,7 +142,7 @@ def parse_args(args):
     parser.add_argument(
         "--prune_keep_ratio",
         type=float,
-        default=0.3,
+        default=1.0,
         help="Fraction of image tokens to keep after observe-layer pruning",
     )
     parser.add_argument(
@@ -105,102 +187,79 @@ def _pad_token_mask(mask: torch.Tensor, pad_left: int, pad_right: int) -> torch.
 
 def run_pruned_inference(
     sida_model,
-    hidden_states: torch.Tensor,
+    last_layer_hidden: torch.Tensor,
     input_ids: torch.Tensor,
     image: torch.Tensor,
     resize_list,
     original_size_list,
+    *,
+    force_predicted_class: int | None = None,
+    force_cls_result: torch.Tensor | None = None,
 ):
     device = input_ids.device
-    batch = input_ids.shape[0]
+    bs = last_layer_hidden.shape[0]
+    seq_len_out = last_layer_hidden.shape[1]
+    seq_len_in = input_ids.shape[1]
+    delta = seq_len_out - seq_len_in
 
-    if isinstance(hidden_states, torch.Tensor):
-        hidden_states = hidden_states.detach().clone().contiguous()
+    # Find [CLS] position in input_ids, then shift by delta if it occurs after the image token.
+    cls_token_mask_in = (input_ids == sida_model.cls_token_idx)
+    has_cls = cls_token_mask_in.any(dim=1)
+    cls_pos = torch.zeros(bs, dtype=torch.long, device=device)
+    if has_cls.any():
+        cls_pos[has_cls] = cls_token_mask_in[has_cls].int().argmax(dim=1)
 
-    def _align_mask_length(mask: torch.Tensor, target_len: int) -> torch.Tensor:
-        current_len = mask.shape[1]
-        if current_len == target_len:
-            return mask
-        if current_len > target_len:
-            return mask[:, current_len - target_len :]
-        pad = torch.zeros(
-            (mask.shape[0], target_len - current_len),
-            dtype=mask.dtype,
-            device=mask.device,
-        )
-        return torch.cat([pad, mask], dim=1)
+    if delta != 0:
+        img_token_mask = (input_ids == IMAGE_TOKEN_INDEX)
+        has_img = img_token_mask.any(dim=1)
+        img_pos = torch.zeros(bs, dtype=torch.long, device=device)
+        if has_img.any():
+            img_pos[has_img] = img_token_mask[has_img].int().argmax(dim=1)
+        shift = (cls_pos > img_pos) & has_img
+        cls_pos = cls_pos + shift.long() * delta
 
-    def _match_mask_to_logits(mask: torch.Tensor, logits_flat: torch.Tensor) -> torch.Tensor:
-        target_len = logits_flat.shape[0]
-        mask_flat = mask.reshape(-1)
-        current_len = mask_flat.shape[0]
-        if current_len == target_len:
-            return mask_flat
-        if current_len > target_len:
-            return mask_flat[current_len - target_len :]
-        pad = torch.zeros(
-            target_len - current_len,
-            dtype=mask_flat.dtype,
-            device=mask_flat.device,
-        )
-        return torch.cat([pad, mask_flat], dim=0)
+    cls_pos = cls_pos.clamp_(0, seq_len_out - 1)
+    last_hidden_state_cls = sida_model.model.cls_head[0](last_layer_hidden)
+    cls_result = last_hidden_state_cls[
+        torch.arange(bs, device=device), cls_pos, :
+    ]
 
-    cls_token_mask = (input_ids[:, 1:] == sida_model.cls_token_idx)
-    cls_token_mask = torch.cat(
-        [
-            cls_token_mask,
-            torch.zeros((batch, 1), dtype=torch.bool, device=device),
-        ],
-        dim=1,
-    )
-    cls_token_mask = _pad_token_mask(cls_token_mask, pad_left=255, pad_right=0)
-    cls_token_mask = _align_mask_length(cls_token_mask, hidden_states.shape[1])
-
-    last_hidden_state_cls = sida_model.model.cls_head[0](hidden_states)
-    cls_logits_flat = last_hidden_state_cls.view(-1, last_hidden_state_cls.shape[-1])
-    cls_mask_flat = _match_mask_to_logits(cls_token_mask, cls_logits_flat)
-    cls_result = cls_logits_flat[cls_mask_flat]
-
-    predicted_class = 0
-    if cls_result.shape[0] > 0:
-        predicted_class = torch.argmax(cls_result[-1], dim=-1).item()
+    # Predicted class from the last [CLS] (batch-size assumed 1 for interactive chat).
+    predicted_class = int(torch.argmax(cls_result[0], dim=-1).item())
+    if force_predicted_class is not None:
+        predicted_class = int(force_predicted_class)
 
     pred_masks = []
     if predicted_class == 2:
-        seg_token_mask = (input_ids[:, 1:] == sida_model.seg_token_idx)
-        seg_token_mask = _pad_token_mask(seg_token_mask, pad_left=255, pad_right=1)
-        seg_token_mask = _align_mask_length(seg_token_mask, hidden_states.shape[1])
+        seg_token_mask_in = (input_ids == sida_model.seg_token_idx)
+        if seg_token_mask_in.any():
+            # Map [SEG] token positions from input token space -> expanded hidden-state space.
+            img_token_mask = (input_ids == IMAGE_TOKEN_INDEX)
+            has_img = img_token_mask.any(dim=1)
+            img_pos = torch.zeros(bs, dtype=torch.long, device=device)
+            if delta != 0 and has_img.any():
+                img_pos[has_img] = img_token_mask[has_img].int().argmax(dim=1)
 
-        if seg_token_mask.any():
-            hidden_proj = sida_model.model.text_hidden_fcs[0](hidden_states)
-            last_hidden_state = hidden_proj
+            hidden_proj = sida_model.model.text_hidden_fcs[0](last_layer_hidden)
+            per_sample_seg_embeds = []
+            for b in range(bs):
+                seg_pos_in = torch.nonzero(seg_token_mask_in[b], as_tuple=False).squeeze(1)
+                if seg_pos_in.numel() == 0:
+                    per_sample_seg_embeds.append(
+                        torch.zeros((0, hidden_proj.shape[-1]), device=device, dtype=hidden_proj.dtype)
+                    )
+                    continue
+                seg_pos_out = seg_pos_in
+                if delta != 0 and has_img[b]:
+                    seg_pos_out = seg_pos_in + (seg_pos_in > img_pos[b]).long() * delta
+                seg_pos_out = seg_pos_out.clamp(0, seq_len_out - 1)
+                per_sample_seg_embeds.append(hidden_proj[b, seg_pos_out, :])
 
-            last_hidden_state_flat = last_hidden_state.reshape(
-                -1, last_hidden_state.shape[-1]
-            )
-            seg_mask_flat = _match_mask_to_logits(seg_token_mask, last_hidden_state_flat)
-            pred_embeddings = last_hidden_state_flat[seg_mask_flat]
+            # Interactive chat uses batch size 1; keep list-of-tensors structure.
+            pred_embeddings = per_sample_seg_embeds
 
-            seg_token_counts = seg_token_mask.int().sum(-1)
-            seg_token_offset = seg_token_counts.cumsum(-1)
-            seg_token_offset = torch.cat(
-                [
-                    torch.zeros(1, dtype=torch.long, device=device),
-                    seg_token_offset,
-                ],
-                dim=0,
-            )
-            offset = torch.arange(0, batch + 1, dtype=torch.long, device=device)
-            seg_token_offset = seg_token_offset[offset]
-
-            pred_embeddings_ = []
-            for i in range(len(seg_token_offset) - 1):
-                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-                pred_embeddings_.append(pred_embeddings[start_i:end_i])
-
-            pred_embeddings = pred_embeddings_
-
-            cls_projected = sida_model.model.sida_fc1(cls_result)
+            cls_for_attn = force_cls_result if force_cls_result is not None else cls_result
+            cls_projected = sida_model.model.sida_fc1(cls_for_attn)
             enhanced_pred_embeddings = []
             for i in range(len(pred_embeddings)):
                 if pred_embeddings[i].shape[0] == 0:
@@ -217,7 +276,6 @@ def run_pruned_inference(
 
             image_embeddings = sida_model.get_visual_embs(image)
             multimask_output = False
-
             for i in range(len(enhanced_pred_embeddings)):
                 if enhanced_pred_embeddings[i].shape[0] == 0:
                     continue
@@ -227,9 +285,7 @@ def run_pruned_inference(
                     masks=None,
                     text_embeds=enhanced_pred_embeddings[i].unsqueeze(1),
                 )
-                sparse_embeddings = sparse_embeddings.to(
-                    enhanced_pred_embeddings[i].dtype
-                )
+                sparse_embeddings = sparse_embeddings.to(enhanced_pred_embeddings[i].dtype)
                 low_res_masks, _ = sida_model.model.visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
                     image_pe=sida_model.model.visual_model.prompt_encoder.get_dense_pe(),
@@ -258,6 +314,11 @@ def main(args):
     args = parse_args(args)
     os.makedirs(args.vis_save_path, exist_ok=True)
 
+    device = torch.device(
+        "cuda" if (torch.cuda.is_available() and torch.cuda.device_count() > 0) else "cpu"
+    )
+    gpu_fallback_reason = None
+
     # Create model
     tokenizer = AutoTokenizer.from_pretrained(
         args.version,
@@ -270,11 +331,15 @@ def main(args):
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
     args.cls_token_idx = tokenizer("[CLS]", add_special_tokens=False).input_ids[0]
 
+    # Precision policy:
+    # - On CUDA: honor args.precision.
+    # - On CPU: force float32 (many ops, e.g. CLIP conv2d, don't support fp16/bf16 on CPU).
     torch_dtype = torch.float32
-    if args.precision == "bf16":
-        torch_dtype = torch.bfloat16
-    elif args.precision == "fp16":
-        torch_dtype = torch.half
+    if device.type == "cuda":
+        if args.precision == "bf16":
+            torch_dtype = torch.bfloat16
+        elif args.precision == "fp16":
+            torch_dtype = torch.half
 
     kwargs = {"torch_dtype": torch_dtype}
     if args.load_in_4bit:
@@ -316,25 +381,40 @@ def main(args):
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    # Skip DeepSpeed initialization for now
-    if torch.cuda.is_available():
-        model = model.cuda()
+    # Move model to device.
+    # NOTE: If this fails (e.g., OOM), we fall back to CPU but keep a clear reason so
+    # Peak GPU Memory doesn't misleadingly show 0.00 GB as if it were measured.
+    try:
+        model = model.to(device)
+    except Exception as exc:
+        print(f"Failed to move model to {device}: {exc}")
+        gpu_fallback_reason = str(exc)
+        device = torch.device("cpu")
+        model = model.to(device)
+
+    cpu_forced_fp32 = device.type != "cuda"
 
     print("Before vision tower initialization")
     try:
         model.get_model().initialize_vision_modules(model.get_model().config)
         vision_tower = model.get_model().get_vision_tower()
-        vision_tower.to(dtype=torch_dtype)
+        vision_tower.to(dtype=(torch.float32 if cpu_forced_fp32 else torch_dtype), device=device)
     except AttributeError:
         print("Vision tower initialization skipped as SIDA-7B-v1 may not have this module.")
 
     print("Before precision setting")
-    if args.precision == "bf16":
-        model = model.bfloat16().cuda()
-    elif args.precision == "fp16":
-        model = model.half().cuda()
-    else:
-        model = model.float().cuda()
+    # Avoid dtype casting for quantized models.
+    if not (args.load_in_4bit or args.load_in_8bit):
+        if cpu_forced_fp32:
+            model = model.float()
+        else:
+            if args.precision == "bf16":
+                model = model.bfloat16()
+            elif args.precision == "fp16":
+                model = model.half()
+            else:
+                model = model.float()
+    model = model.to(device)
 
     print("Before clip_image_processor")
     clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
@@ -345,30 +425,47 @@ def main(args):
     print("Model loaded successfully")
 
     #追加
-    if torch.cuda.device_count() > 1:
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
         print(f"Using {torch.cuda.device_count()} GPUs")
-    else:
-        model = model.cuda()
     #追加)
 
     while True:
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
 
-        prompt = input("Please input your prompt: ")
-        prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
+        try:
+            prompt = input("Please input your prompt: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting chat.")
+            break
+        # Align chat inference prompt format with the evaluation/training conversations.
+        # In the dataset pipeline, [CLS]/[SEG] appear in the *assistant* response, and the model
+        # derives segmentation queries from the *input* token positions of [SEG] (teacher forcing).
+        # To avoid degraded mask quality from a context-free, user-appended [SEG], we:
+        # - Always add an assistant-side "[CLS]" token for classification.
+        # - If (and only if) the model predicts tampered, run a second forward pass with an
+        #   assistant-side tampered template ending in "[SEG]" to extract a meaningful seg embedding.
+        question_text = (prompt or "").strip()
+        if not question_text:
+            question_text = (
+                "Can you identify if this image is real, full synthetic, or tampered image? "
+                "Please mask the tampered regions if it is tampered."
+            )
+        conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{question_text}")
+        conv.append_message(conv.roles[1], "[CLS]")
+        prompt = conv.get_prompt()
         if args.use_mm_start_end:
             replace_token = (
                 DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
             )
             prompt = prompt.replace(DEFAULT_IMAGE_TOKEN, replace_token)
 
-        conv.append_message(conv.roles[0], prompt)
-        conv.append_message(conv.roles[1], "")
-        prompt = conv.get_prompt()
-
-        image_path = input("Please input the image path: ")
+        try:
+            image_path = input("Please input the image path: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting chat.")
+            break
         if not os.path.exists(image_path):
             print("File not found in {}".format(image_path))
             continue
@@ -382,14 +479,17 @@ def main(args):
                 "pixel_values"
             ][0]
             .unsqueeze(0)
-            .cuda()
+            .to(device)
         )
-        if args.precision == "bf16":
-            image_clip = image_clip.bfloat16()
-        elif args.precision == "fp16":
-            image_clip = image_clip.half()
-        else:
+        if cpu_forced_fp32:
             image_clip = image_clip.float()
+        else:
+            if args.precision == "bf16":
+                image_clip = image_clip.bfloat16()
+            elif args.precision == "fp16":
+                image_clip = image_clip.half()
+            else:
+                image_clip = image_clip.float()
 
         image = transform.apply_image(image_np)
         resize_list = [image.shape[:2]]
@@ -397,19 +497,22 @@ def main(args):
         image = (
             preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
             .unsqueeze(0)
-            .cuda()
+            .to(device)
         )
-        if args.precision == "bf16":
-            image = image.bfloat16()
-        elif args.precision == "fp16":
-            image = image.half()
-        else:
+        if cpu_forced_fp32:
             image = image.float()
+        else:
+            if args.precision == "bf16":
+                image = image.bfloat16()
+            elif args.precision == "fp16":
+                image = image.half()
+            else:
+                image = image.float()
 
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-        input_ids = input_ids.unsqueeze(0).cuda()
+        input_ids = input_ids.unsqueeze(0).to(device)
 
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long).cuda()
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long).to(device)
         sida_model = model.module if isinstance(model, nn.DataParallel) else model
 
         special_token_ids = [
@@ -424,58 +527,138 @@ def main(args):
             if tok is not None
         ]
 
-        input_dict = {
+        base_input_dict = {
             "input_ids": input_ids,
             "attention_masks": attention_mask,
             "images_clip": image_clip,
         }
 
-        if not args.disable_token_pruning:
-            input_dict = prune_batch_inputs(
-                model,
-                input_dict,
-                tokenizer,
-                keep_ratio=args.prune_keep_ratio,
-                observe_layer=args.prune_observe_layer,
-                special_token_ids=special_token_ids,
-            )
-        else:
-            input_dict.setdefault(
-                "keep_indices",
-                [torch.arange(input_ids.shape[1], device=input_ids.device)],
-            )
-
-        input_ids = input_dict["input_ids"].to(input_ids.device)
-        attention_mask = input_dict["attention_masks"].to(attention_mask.device)
-        cached_hidden_states = input_dict.get("cached_hidden_states")
-
-        if cached_hidden_states is None:
-            with torch.inference_mode():
-                fallback = sida_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    images=image_clip,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-            cached_hidden_states = fallback.hidden_states[-1].detach()
+        do_prune = (not args.disable_token_pruning) and (float(args.prune_keep_ratio) < 1.0)
 
         def execute_inference():
-            return run_pruned_inference(
-                sida_model=sida_model,
-                hidden_states=cached_hidden_states,
-                input_ids=input_ids,
-                image=image,
-                resize_list=resize_list,
-                original_size_list=original_size_list,
-            )
+            """Run the *full* inference compute (optionally including pruning observe pass).
 
-        torch.cuda.reset_peak_memory_stats()
+            FLOPs scope policy:
+            - Includes: token pruning observe+selection (if enabled), LLaVA forward to obtain
+              last-layer hidden states (if not provided by pruning), and SIDA heads + SAM mask decoder.
+            - Excludes: image loading/decoding, prompt text I/O, and CPU-side preprocessing.
+            """
+            with torch.no_grad():
+                working = dict(base_input_dict)
+                if do_prune:
+                    working = prune_batch_inputs(
+                        model,
+                        working,
+                        tokenizer,
+                        keep_ratio=args.prune_keep_ratio,
+                        observe_layer=args.prune_observe_layer,
+                        special_token_ids=special_token_ids,
+                    )
+
+                run_input_ids = working["input_ids"].to(device)
+                run_attention_mask = working["attention_masks"].to(device)
+                cached_hidden_states = working.get("cached_hidden_states")
+
+                if cached_hidden_states is None:
+                    # No pruning (or pruning path couldn't provide cached hidden states):
+                    # run the underlying LLaVA/LLaMA forward to get last-layer hidden states.
+                    fallback = LlavaLlamaForCausalLM.forward(
+                        sida_model,
+                        input_ids=run_input_ids,
+                        attention_mask=run_attention_mask,
+                        images=image_clip,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    cached_hidden_states = _extract_last_layer_hidden_states(fallback).detach()
+
+                # Normalize hidden states shape to batch-first (B, seq, hidden).
+                if not isinstance(cached_hidden_states, torch.Tensor):
+                    raise RuntimeError(
+                        f"cached_hidden_states must be a Tensor, got {type(cached_hidden_states)}"
+                    )
+                if cached_hidden_states.dim() == 2:
+                    cached_hidden_states = cached_hidden_states.unsqueeze(0)
+                elif cached_hidden_states.dim() == 4:
+                    # Some models might return (layers, B, seq, hidden); take the last layer.
+                    cached_hidden_states = cached_hidden_states[-1]
+                if cached_hidden_states.dim() != 3:
+                    raise RuntimeError(
+                        f"Unexpected cached_hidden_states shape: {tuple(cached_hidden_states.shape)}"
+                    )
+
+                # 1) Classification pass: prompt includes assistant-side [CLS] only.
+                out = run_pruned_inference(
+                    sida_model=sida_model,
+                    last_layer_hidden=cached_hidden_states,
+                    input_ids=run_input_ids,
+                    image=image,
+                    resize_list=resize_list,
+                    original_size_list=original_size_list,
+                )
+
+                # 2) If tampered, run a second forward pass with an assistant-side tampered template
+                # ending in [SEG] to obtain a meaningful seg embedding (matches SID_Set.py).
+                if int(out["predicted_class"]) == 2:
+                    seg_conv = conversation_lib.conv_templates[args.conv_type].copy()
+                    seg_conv.messages = []
+                    seg_conv.append_message(seg_conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{question_text}")
+                    seg_conv.append_message(seg_conv.roles[1], "[CLS] The image is tampered [SEG]")
+                    seg_prompt = seg_conv.get_prompt()
+                    if args.use_mm_start_end:
+                        seg_prompt = seg_prompt.replace(DEFAULT_IMAGE_TOKEN, replace_token)
+
+                    seg_input_ids = tokenizer_image_token(
+                        seg_prompt, tokenizer, return_tensors="pt"
+                    ).unsqueeze(0).to(device)
+                    seg_attention_mask = torch.ones_like(seg_input_ids, dtype=torch.long).to(device)
+
+                    fallback_seg = LlavaLlamaForCausalLM.forward(
+                        sida_model,
+                        input_ids=seg_input_ids,
+                        attention_mask=seg_attention_mask,
+                        images=image_clip,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    seg_hidden = _extract_last_layer_hidden_states(fallback_seg).detach()
+
+                    # Normalize hidden states shape to batch-first (B, seq, hidden).
+                    if not isinstance(seg_hidden, torch.Tensor):
+                        raise RuntimeError(
+                            f"seg_hidden must be a Tensor, got {type(seg_hidden)}"
+                        )
+                    if seg_hidden.dim() == 2:
+                        seg_hidden = seg_hidden.unsqueeze(0)
+                    elif seg_hidden.dim() == 4:
+                        seg_hidden = seg_hidden[-1]
+                    if seg_hidden.dim() != 3:
+                        raise RuntimeError(
+                            f"Unexpected seg_hidden shape: {tuple(seg_hidden.shape)}"
+                        )
+
+                    seg_out = run_pruned_inference(
+                        sida_model=sida_model,
+                        last_layer_hidden=seg_hidden,
+                        input_ids=seg_input_ids,
+                        image=image,
+                        resize_list=resize_list,
+                        original_size_list=original_size_list,
+                        force_predicted_class=2,
+                        force_cls_result=out["logits"],
+                    )
+                    out["pred_masks"] = seg_out["pred_masks"]
+
+                return out
+
+        cuda_device_ids = _get_cuda_device_ids_for_peak(model, device)
+        if device.type == "cuda" and cuda_device_ids:
+            _reset_peak_cuda_memory_stats(cuda_device_ids)
         start_time = time.time()
 
         if args.measure_flops:
             activities = [torch.profiler.ProfilerActivity.CPU]
-            if torch.cuda.is_available():
+            if device.type == "cuda" and torch.cuda.is_available():
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
             with torch.profiler.profile(
                 activities=activities,
@@ -484,39 +667,24 @@ def main(args):
                 record_shapes=False,
             ) as prof:
                 inference_outputs = execute_inference()
-            total_flops = sum(ev.flops for ev in prof.key_averages() if ev.flops)
-            print(f"Total FLOPs: {total_flops / 1e12:.2f} TFLOPs")
+            total_flops = _sum_profiled_flops(prof)
+            print(f"Total FLOPs: {_format_flops(total_flops)}")
         else:
             inference_outputs = execute_inference()
 
         end_time = time.time()
         inference_time = end_time - start_time
-        peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        if device.type == "cuda" and cuda_device_ids:
+            peak_memory = _peak_cuda_memory_gb(cuda_device_ids)
+            peak_memory_text = f"{peak_memory:.2f} GB"
+        else:
+            peak_memory_text = "N/A (ran on CPU)" if gpu_fallback_reason else "N/A"
 
         predicted_class = inference_outputs["predicted_class"]
         pred_masks = inference_outputs["pred_masks"]
-
-
-        # FLOPs計算をここに移動（推論後）
-        try:
-            llama = model.model  # LlamaModel
-            llama.eval()
-            dummy_input_ids = torch.randint(
-                0, tokenizer.vocab_size, (1, 10), device=llama.device
-            )
-
-            flops, params = profile(
-                llama,
-                inputs=(dummy_input_ids,),
-                verbose=False,
-            )
-            print(f"Language FLOPs: {flops / 1e12:.2f} TFLOPs")
-        except Exception as e:
-            print(f"FLOPs calculation failed: {e}")
-
         # コスト表示
         print(f"Inference Time: {inference_time:.4f} seconds")
-        print(f"Peak GPU Memory: {peak_memory:.2f} GB")
+        print(f"Peak GPU Memory: {peak_memory_text}")
         #追加)
 
         class_responses = {

@@ -101,6 +101,18 @@ def parse_args(args):
         type=int,
         help="Layer index (can be negative) up to which we run observe-phase before pruning",
     )
+    parser.add_argument(
+        "--prune_keep_ratio",
+        default=KEEP_TOKEN_RATIO,
+        type=float,
+        help="Token keep ratio for pruning (0-1). Use 1.0 to disable pruning.",
+    )
+    parser.add_argument(
+        "--disable_token_pruning",
+        action="store_true",
+        default=False,
+        help="Disable token pruning during evaluation (equivalent to --prune_keep_ratio 1.0).",
+    )
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--print_freq", default=1, type=int)
     parser.add_argument("--start_epoch", default=0, type=int)
@@ -600,21 +612,50 @@ def test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio
     target_meter = AverageMeter("Target", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
 
-    # Calculate total number of batches and samples to use
-    total_batches = len(test_loader)
+    # Fast sampling: build a sampled subset loader so we don't iterate the full test set.
+    sample_indices = None
     if sample_ratio is not None:
-        num_batches = max(1, int(total_batches * sample_ratio))
-        # Generate random indices for sampling
-        sample_indices = set(random.sample(range(total_batches), num_batches))
-        print(f"\ntest on {num_batches}/{total_batches} randomly sampled batches...")
+        try:
+            dataset = test_loader.dataset
+            total_samples = len(dataset)
+            sample_size = max(1, int(total_samples * float(sample_ratio)))
+            rng = random.Random(0)
+            indices = rng.sample(range(total_samples), sample_size)
+
+            from torch.utils.data import DataLoader, Subset
+
+            subset = Subset(dataset, indices)
+
+            test_loader = DataLoader(
+                subset,
+                # NOTE: the original `test_loader` is built with a `batch_sampler`,
+                # so `test_loader.batch_size` is `None`. Passing `None` here disables
+                # auto-collation and breaks our `collate_fn` (it expects a list).
+                batch_size=int(getattr(args, "test_batch_size", 1)),
+                shuffle=False,
+                # Avoid multiprocessing here: `collate_fn` carries a tokenizer via `partial`,
+                # and some environments can mis-handle it under worker processes.
+                num_workers=0,
+                pin_memory=getattr(test_loader, "pin_memory", False),
+                collate_fn=getattr(test_loader, "collate_fn", None),
+                drop_last=False,
+            )
+            print(
+                f"\ntest on {sample_size}/{total_samples} samples (ratio={sample_ratio}) using a sampled subset loader..."
+            )
+        except Exception as exc:
+            print(f"Sampling subset loader failed ({exc}); falling back to batch-skipping sampling.")
+            total_batches = len(test_loader)
+            num_batches = max(1, int(total_batches * float(sample_ratio)))
+            sample_indices = set(random.sample(range(total_batches), num_batches))
+            print(f"test on {num_batches}/{total_batches} randomly sampled batches...")
 
     # Lists for AUC and PR computation (pixel-wise) for tampered masks
     all_mask_scores = []
     all_mask_labels = []
 
     for batch_idx, input_dict in enumerate(tqdm.tqdm(test_loader)):
-        # Skip batches not in our sample if sampling is enabled
-        if sample_ratio is not None and batch_idx not in sample_indices:
+        if sample_indices is not None and batch_idx not in sample_indices:
             continue
         if batch_idx == 0:
             print("\nFirst test batch details:")
@@ -642,18 +683,72 @@ def test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio
             input_dict["images"] = input_dict["images"].float()
             input_dict["images_clip"] = input_dict["images_clip"].float()
 
-        try:
-            input_dict = prune_batch_inputs(
-                model_engine,
-                input_dict,
-                tokenizer,
-                KEEP_TOKEN_RATIO,
-                args.prune_observe_layer,
-                special_token_ids,
-            )
-        except RuntimeError as exc:
+        do_prune = (not getattr(args, "disable_token_pruning", False)) and (
+            float(getattr(args, "prune_keep_ratio", KEEP_TOKEN_RATIO)) < 1.0
+        )
+        if do_prune:
             if batch_idx == 0:
-                print(f"Token pruning skipped due to error: {exc}")
+                pre_ids = input_dict.get("input_ids")
+                pre_mask = input_dict.get("attention_masks")
+                if isinstance(pre_ids, torch.Tensor) and isinstance(pre_mask, torch.Tensor):
+                    pre_valid = int(pre_mask[0].sum().item())
+                    pre_img_placeholders = int(
+                        (pre_ids[0, :pre_valid] == IMAGE_TOKEN_INDEX).sum().item()
+                    )
+                    print(
+                        f"Token pruning enabled: keep_ratio={float(getattr(args, 'prune_keep_ratio', KEEP_TOKEN_RATIO))} "
+                        f"observe_layer={args.prune_observe_layer}"
+                    )
+                    print(
+                        f"Before pruning: input_ids={tuple(pre_ids.shape)} valid={pre_valid} "
+                        f"image_placeholders={pre_img_placeholders}"
+                    )
+            try:
+                input_dict = prune_batch_inputs(
+                    model_engine,
+                    input_dict,
+                    tokenizer,
+                    float(getattr(args, "prune_keep_ratio", KEEP_TOKEN_RATIO)),
+                    args.prune_observe_layer,
+                    special_token_ids,
+                )
+            except RuntimeError as exc:
+                if batch_idx == 0:
+                    print(f"Token pruning skipped due to error: {exc}")
+            if batch_idx == 0 and "keep_indices" in input_dict:
+                post_ids = input_dict.get("input_ids")
+                post_mask = input_dict.get("attention_masks")
+                if isinstance(post_ids, torch.Tensor) and isinstance(post_mask, torch.Tensor):
+                    post_valid = int(post_mask[0].sum().item())
+                    post_img_placeholders = int(
+                        (post_ids[0, :post_valid] == IMAGE_TOKEN_INDEX).sum().item()
+                    )
+                    print(
+                        f"After pruning: input_ids={tuple(post_ids.shape)} valid={post_valid} "
+                        f"image_placeholders={post_img_placeholders}"
+                    )
+
+                seq_lens = input_dict.get("sequence_lengths")
+                if isinstance(seq_lens, torch.Tensor):
+                    print(f"Pruned sequence_lengths: {seq_lens.tolist()}")
+
+                keep0 = input_dict.get("keep_indices", [None])[0]
+                if isinstance(keep0, torch.Tensor):
+                    print(
+                        f"keep_indices[0] count: {int(keep0.numel())} "
+                        f"(min={int(keep0.min().item()) if keep0.numel() else -1}, "
+                        f"max={int(keep0.max().item()) if keep0.numel() else -1})"
+                    )
+
+                cached_hidden_states = input_dict.get("cached_hidden_states")
+                if cached_hidden_states is None:
+                    print("cached_hidden_states: None")
+                elif isinstance(cached_hidden_states, torch.Tensor):
+                    print(
+                        f"cached_hidden_states shape: {tuple(cached_hidden_states.shape)}"
+                    )
+        elif batch_idx == 0:
+            print("Token pruning disabled: running full sequence for all layers")
 
         input_dict['inference'] = True
         with torch.no_grad():
