@@ -11,6 +11,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
                                                      LlavaLlamaModel)
 from .llava.model.token_pruning import (compute_image_token_keep_indices,
+                                        expand_multimodal_placeholders,
                                         prune_attention_mask,
                                         prune_sequence_tensor)
 
@@ -243,22 +244,57 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             else:
                 boundary_hidden = boundary_hidden.reshape(batch_size, -1, boundary_hidden.shape[-1])
 
+        # Align pruning inputs to the expanded multimodal sequence length.
+        # LLaVA replaces IMAGE_TOKEN_INDEX placeholders with image patch tokens; observed
+        # attentions/hidden_states live in that expanded token space.
+        pre_prune_seq_len = int(boundary_hidden.shape[1])
+        expanded_input_ids, expanded_attention_mask = expand_multimodal_placeholders(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            target_seq_len=pre_prune_seq_len,
+            pad_value=(self.config.pad_token_id or self.config.eos_token_id or 0),
+            image_token_id=IMAGE_TOKEN_INDEX,
+        )
+
         keep_indices = compute_image_token_keep_indices(
             attn_tensor,
-            input_ids,
-            attention_mask,
+            expanded_input_ids,
+            expanded_attention_mask,
             keep_ratio=keep_ratio,
             image_token_id=IMAGE_TOKEN_INDEX,
             special_token_ids=special_token_ids,
         )
 
+        # Safety: guard against any out-of-range indices before touching CUDA indexing kernels.
+        # If invalid indices are produced for any reason, fall back to keeping all valid tokens.
+        if len(keep_indices) == batch_size:
+            seq_len_limit = int(expanded_input_ids.size(1))
+            invalid_found = False
+            for b in range(batch_size):
+                if keep_indices[b].numel() == 0:
+                    continue
+                max_idx = int(keep_indices[b].max().item())
+                min_idx = int(keep_indices[b].min().item())
+                if min_idx < 0 or max_idx >= seq_len_limit:
+                    invalid_found = True
+                    break
+            if invalid_found:
+                logger.warning(
+                    "observe_prune_prompt produced out-of-range keep_indices; falling back to no pruning."
+                )
+                keep_indices = []
+
         def build_identity_keep_indices():
-            attention_mask_bool = attention_mask.to(dtype=torch.bool, device=input_ids.device)
+            attention_mask_bool = expanded_attention_mask.to(
+                dtype=torch.bool, device=expanded_input_ids.device
+            )
             identity = []
             for b in range(batch_size):
                 valid_positions = torch.nonzero(attention_mask_bool[b], as_tuple=False).squeeze(1)
                 if valid_positions.numel() == 0:
-                    valid_positions = torch.arange(seq_len, device=input_ids.device)
+                    valid_positions = torch.arange(
+                        pre_prune_seq_len, device=expanded_input_ids.device
+                    )
                 identity.append(valid_positions)
             return identity
 
@@ -286,15 +322,14 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             pad_token_id = self.config.eos_token_id or 0
 
         pruned_input_ids, lengths = prune_sequence_tensor(
-            input_ids, keep_indices, pad_value=pad_token_id
+            expanded_input_ids, keep_indices, pad_value=pad_token_id
         )
-        pruned_attention_mask = prune_attention_mask(attention_mask, keep_indices)
+        pruned_attention_mask = prune_attention_mask(expanded_attention_mask, keep_indices)
 
-        position_ids = self._build_position_ids(attention_mask)
-        pruned_position_ids, _ = prune_sequence_tensor(
-            position_ids, keep_indices, pad_value=0
-        )
-        pruned_position_ids = pruned_position_ids.long()
+        # IMPORTANT: After pruning, position_ids must be renumbered to be contiguous
+        # (0..new_seq_len-1). Keeping original indices (e.g., [0, 5, 10, ...]) can
+        # exceed RoPE cache length (= new_seq_len) and trigger CUDA IndexKernel OOB.
+        pruned_position_ids = self._build_position_ids(pruned_attention_mask).long()
 
         pruned_hidden, _ = prune_sequence_tensor(
             boundary_hidden, keep_indices, pad_value=0.0
@@ -331,6 +366,7 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             "lengths": lengths,
             "observe_outputs": observe_outputs,
             "resume_outputs": resume_outputs,
+            "pre_prune_seq_len": pre_prune_seq_len,
         }
     def get_visual_embs(self, pixel_values: torch.FloatTensor):
         with torch.no_grad():

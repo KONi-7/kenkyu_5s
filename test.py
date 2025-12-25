@@ -687,6 +687,22 @@ def test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio
             float(getattr(args, "prune_keep_ratio", KEEP_TOKEN_RATIO)) < 1.0
         )
         if do_prune:
+            if batch_idx == 0:
+                pre_ids = input_dict.get("input_ids")
+                pre_mask = input_dict.get("attention_masks")
+                if isinstance(pre_ids, torch.Tensor) and isinstance(pre_mask, torch.Tensor):
+                    pre_valid = int(pre_mask[0].sum().item())
+                    pre_img_placeholders = int(
+                        (pre_ids[0, :pre_valid] == IMAGE_TOKEN_INDEX).sum().item()
+                    )
+                    print(
+                        f"Token pruning enabled: keep_ratio={float(getattr(args, 'prune_keep_ratio', KEEP_TOKEN_RATIO))} "
+                        f"observe_layer={args.prune_observe_layer}"
+                    )
+                    print(
+                        f"Before pruning: input_ids={tuple(pre_ids.shape)} valid={pre_valid} "
+                        f"image_placeholders={pre_img_placeholders}"
+                    )
             try:
                 input_dict = prune_batch_inputs(
                     model_engine,
@@ -699,6 +715,38 @@ def test(test_loader, model_engine, epoch, writer, args, tokenizer, sample_ratio
             except RuntimeError as exc:
                 if batch_idx == 0:
                     print(f"Token pruning skipped due to error: {exc}")
+            if batch_idx == 0 and "keep_indices" in input_dict:
+                post_ids = input_dict.get("input_ids")
+                post_mask = input_dict.get("attention_masks")
+                if isinstance(post_ids, torch.Tensor) and isinstance(post_mask, torch.Tensor):
+                    post_valid = int(post_mask[0].sum().item())
+                    post_img_placeholders = int(
+                        (post_ids[0, :post_valid] == IMAGE_TOKEN_INDEX).sum().item()
+                    )
+                    print(
+                        f"After pruning: input_ids={tuple(post_ids.shape)} valid={post_valid} "
+                        f"image_placeholders={post_img_placeholders}"
+                    )
+
+                seq_lens = input_dict.get("sequence_lengths")
+                if isinstance(seq_lens, torch.Tensor):
+                    print(f"Pruned sequence_lengths: {seq_lens.tolist()}")
+
+                keep0 = input_dict.get("keep_indices", [None])[0]
+                if isinstance(keep0, torch.Tensor):
+                    print(
+                        f"keep_indices[0] count: {int(keep0.numel())} "
+                        f"(min={int(keep0.min().item()) if keep0.numel() else -1}, "
+                        f"max={int(keep0.max().item()) if keep0.numel() else -1})"
+                    )
+
+                cached_hidden_states = input_dict.get("cached_hidden_states")
+                if cached_hidden_states is None:
+                    print("cached_hidden_states: None")
+                elif isinstance(cached_hidden_states, torch.Tensor):
+                    print(
+                        f"cached_hidden_states shape: {tuple(cached_hidden_states.shape)}"
+                    )
         elif batch_idx == 0:
             print("Token pruning disabled: running full sequence for all layers")
 
