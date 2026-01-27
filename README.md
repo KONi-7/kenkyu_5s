@@ -1,5 +1,5 @@
 <div align="center">
-<img src="./images/SIDA.png" alt="Image Alt Text" width="150" height="150">
+<h3>以下の論文を参考に構築した．環境設定，データセットのインストール，重みのインストール，SIDA-7Bのインストールを以下の手順をもとに行うと動作する．</h3>
 <h3> SIDA: Social Media Image Deepfake Detection, Localization and Explanation with Large Multimodal Model </h3>
 
   <p align="center">
